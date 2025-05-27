@@ -6579,6 +6579,7 @@ load(const uint8 *buf, uint32 size, WASMModule *module,
     const uint8 *p = buf, *p_end = buf_end;
     uint32 magic_number, version;
     WASMSection *section_list = NULL;
+    uint16 component_version, component_layer;
 
     CHECK_BUF1(p, p_end, sizeof(uint32));
     magic_number = read_uint32(p);
@@ -6594,6 +6595,27 @@ load(const uint8 *buf, uint32 size, WASMModule *module,
     version = read_uint32(p);
     if (!is_little_endian())
         exchange32((uint8 *)&version);
+
+    /* Check for WASM component model preamble */
+    if (version == COMPONENT_MODEL_VERSION_0D) {
+        CHECK_BUF1(p, p_end, sizeof(uint16));
+        component_layer = TEMPLATE_READ_VALUE(uint16, p);
+        if (!is_little_endian())
+            exchange32((uint8 *)&component_layer);
+
+        if (component_layer == COMPONENT_MODEL_LAYER_01) {
+            os_printf("WASM component detected.\n");
+            /* TODO: Implement component loading */
+            set_error_buf(error_buf, error_buf_size,
+                          "WASM component loading not yet implemented.");
+            /* Return false as per function's error handling for now.
+               This will lead to wasm_loader_unload being called. */
+            return false;
+        }
+        /* If it's not the component layer we're looking for,
+           rewind p to treat it as a regular WASM module version check. */
+        p -= sizeof(uint16);
+    }
 
     if (version != WASM_CURRENT_VERSION) {
         set_error_buf(error_buf, error_buf_size, "unknown binary version");

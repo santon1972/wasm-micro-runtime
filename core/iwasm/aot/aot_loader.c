@@ -9,6 +9,7 @@
 #include "../common/wasm_runtime_common.h"
 #include "../common/wasm_native.h"
 #include "../common/wasm_loader_common.h"
+#include "../common/wasm_component.h"
 #include "../compilation/aot.h"
 #if WASM_ENABLE_AOT_VALIDATOR != 0
 #include "aot_validator.h"
@@ -4340,14 +4341,52 @@ load(const uint8 *buf, uint32 size, AOTModule *module,
     uint32 magic_number, version;
     AOTSection *section_list = NULL;
     bool ret;
+    uint16 component_layer;
 
     read_uint32(p, p_end, magic_number);
-    if (magic_number != AOT_MAGIC_NUMBER) {
+    if (magic_number != AOT_MAGIC_NUMBER
+#if WASM_ENABLE_INTERP != 0
+        /* Also check WASM_MAGIC_NUMBER for wasm file,
+           aot runtime may be used to load wasm file */
+        && magic_number != WASM_MAGIC_NUMBER
+#endif
+       ) {
         set_error_buf(error_buf, error_buf_size, "magic header not detected");
         return false;
     }
 
     read_uint32(p, p_end, version);
+
+#if WASM_ENABLE_INTERP != 0
+    if (magic_number == WASM_MAGIC_NUMBER) {
+        /* Check for WASM component model preamble */
+        if (version == COMPONENT_MODEL_VERSION_0D) {
+            CHECK_BUF(p, p_end, sizeof(uint16));
+            component_layer = TEMPLATE_READ_VALUE(uint16, p);
+            if (!is_little_endian())
+                exchange_uint16((uint8 *)&component_layer);
+
+            if (component_layer == COMPONENT_MODEL_LAYER_01) {
+                os_printf("WASM component detected.\n");
+                /* TODO: Implement component loading */
+                set_error_buf(error_buf, error_buf_size,
+                              "WASM component loading not yet implemented for AOT.");
+                return false;
+            }
+            /* If it's not the component layer we're looking for,
+               rewind p to treat it as a regular WASM module version check. */
+            p -= sizeof(uint16);
+        }
+
+        if (version != WASM_CURRENT_VERSION) {
+            set_error_buf(error_buf, error_buf_size, "unknown binary version");
+            return false;
+        }
+        /* It is a wasm file, return and let wasm loader load it */
+        return NULL;
+    }
+#endif /* WASM_ENABLE_INTERP */
+
     if (!aot_compatible_version(version)) {
         set_error_buf(error_buf, error_buf_size, "unknown binary version");
         return false;
