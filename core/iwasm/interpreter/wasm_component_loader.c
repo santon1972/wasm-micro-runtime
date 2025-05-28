@@ -4,6 +4,7 @@
  */
 
 #include "wasm_component_loader.h"
+#include "wasm_component_canonical.h" /* <-- ADDED --> */
 #include "bh_log.h"
 #include "bh_platform.h" /* For os_printf, TEMPLATE_READ_VALUE */
 #include "wasm_loader.h" /* For wasm_loader_load, wasm_loader_unload, LoadArgs */
@@ -237,10 +238,11 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                            WASMComponent *component,
                            char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Core Instance section found.\n");
+    os_printf("Component Core Instance section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
@@ -248,10 +250,11 @@ load_core_type_section(const uint8 **p_buf, const uint8 *buf_end,
                        WASMComponent *component,
                        char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Core Type section found.\n");
+    os_printf("Component Core Type section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
@@ -259,10 +262,11 @@ load_component_section(const uint8 **p_buf, const uint8 *buf_end,
                        WASMComponent *component,
                        char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component (nested) Component section found.\n");
+    os_printf("Component (nested) Component section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
@@ -270,10 +274,11 @@ load_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                       WASMComponent *component,
                       char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Instance section found.\n");
+    os_printf("Component Instance section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
@@ -281,45 +286,51 @@ load_alias_section(const uint8 **p_buf, const uint8 *buf_end,
                    WASMComponent *component,
                    char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Alias section found.\n");
+    os_printf("Component Alias section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
-load_type_section(const uint8 **p_buf, const uint8 *buf_end,
+load_type_section(const uint8 **p_buf, const uint8 *buf_end, /* Outer Type Section ID 6 */
                   WASMComponent *component,
                   char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Type section found.\n"); /* This is Section ID 6 */
-    /* For Subtask 4, we are interested in Component Type Section ID 7 (deftype) */
-    /* This function (for Section ID 6) will remain a stub for now. */
+    os_printf("Component Type section (ID 6 - Outer types) found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
+/* Stub for the new function that will handle COMPONENT_SECTION_ID_DEFINED_TYPE (ID 7) */
 static bool
-load_canonical_section(const uint8 **p_buf, const uint8 *buf_end,
-                       WASMComponent *component,
-                       char *error_buf, uint32 error_buf_size)
+load_component_defined_type_section(const uint8 **p_buf, const uint8 *buf_end,
+                                   WASMComponent *component,
+                                   char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Canonical section found.\n");
+    os_printf("Component Defined Type section (ID 7 - deftype) found (stubbed in loader).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
+    /* In a real implementation, this would parse the defined types and populate component->defined_types */
+    /* The main loop advances the pointer by section_size if this function returns true. */
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
+
 
 static bool
 load_start_section(const uint8 **p_buf, const uint8 *buf_end,
                    WASMComponent *component,
                    char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Start section found.\n");
+    os_printf("Component Start section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
@@ -327,10 +338,11 @@ load_import_section(const uint8 **p_buf, const uint8 *buf_end,
                     WASMComponent *component,
                     char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Import section found.\n");
+    os_printf("Component Import section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 static bool
@@ -338,10 +350,11 @@ load_export_section(const uint8 **p_buf, const uint8 *buf_end,
                     WASMComponent *component,
                     char *error_buf, uint32 error_buf_size)
 {
-    os_printf("Component Export section found.\n");
+    os_printf("Component Export section found (stubbed).\n");
+    (void)component; (void)p_buf; (void)buf_end; (void)error_buf; (void)error_buf_size;
     return true;
-fail:
-    return false;
+/* fail: */
+    /* return false; */
 }
 
 WASMComponent*
@@ -387,6 +400,7 @@ wasm_component_load(const uint8 *buf, uint32 size,
     if (!component) {
         return NULL;
     }
+    memset(component, 0, sizeof(WASMComponent)); /* Initialize all fields to 0/NULL */
     component->version = version;
     component->layer = layer;
 
@@ -401,82 +415,45 @@ wasm_component_load(const uint8 *buf, uint32 size,
         const uint8 *section_start = p;
 
         switch (section_id) {
-            case COMPONENT_SECTION_ID_CORE_MODULE:
-                if (!load_core_module_section(&p, p + section_size, component,
-                                              error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_CORE_MODULE: /* ID 0 */
+                if (!load_core_module_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_CORE_INSTANCE:
-                if (!load_core_instance_section(&p, p + section_size, component,
-                                                error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_CORE_INSTANCE: /* ID 1 */
+                if (!load_core_instance_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_CORE_TYPE:
-                 if (!load_core_type_section(&p, p + section_size, component,
-                                            error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_CORE_TYPE: /* ID 2 */
+                 if (!load_core_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_COMPONENT:
-                if (!load_component_section(&p, p + section_size, component,
-                                            error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_COMPONENT: /* ID 3 */
+                if (!load_component_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_INSTANCE:
-                if (!load_instance_section(&p, p + section_size, component,
-                                           error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_INSTANCE: /* ID 4 */
+                if (!load_instance_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_ALIAS:
-                if (!load_alias_section(&p, p + section_size, component,
-                                        error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_ALIAS: /* ID 5 */
+                if (!load_alias_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_TYPE: /* This is Section ID 6 */
-                if (!load_type_section(&p, p + section_size, component, /* This is for Section ID 6 */
-                                       error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_TYPE: /* ID 6 (Outer Type Section) */
+                if (!load_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_CANONICAL:
-                if (!load_canonical_section(&p, p + section_size, component,
-                                            error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_DEFINED_TYPE: /* ID 7 (Component Defined Type Section - deftype) */
+                if (!load_component_defined_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_START:
-                if (!load_start_section(&p, p + section_size, component,
-                                        error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_CANONICAL: /* ID 8 - Calls function from wasm_component_canonical.c */
+                if (!load_canonical_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_IMPORT:
-                if (!load_import_section(&p, p + section_size, component,
-                                         error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_START: /* ID 9 */
+                if (!load_start_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
-            case COMPONENT_SECTION_ID_EXPORT:
-                if (!load_export_section(&p, p + section_size, component,
-                                         error_buf, error_buf_size))
-                    goto fail;
+            case COMPONENT_SECTION_ID_IMPORT: /* ID 10 */
+                if (!load_import_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+                break;
+            case COMPONENT_SECTION_ID_EXPORT: /* ID 11 */
+                if (!load_export_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
                 break;
             default:
-                 /* Check if it's the Component Type Section (ID 7) for deftypes */
-                 /* This is a bit of a hack as section IDs can be anything for custom sections */
-                 /* but the spec usually lists known sections first. */
-                 /* A better approach would be to have a distinct ID for Component Type Section in wasm_component_loader.h */
-                 /* For now, let's assume if it's not any of the above, and if we want to handle deftype section, */
-                 /* we might need a way to identify it, or it's implicitly handled by the Type Section (ID 6) above */
-                 /* if the spec means that one defines all types. */
-                 /* Given the subtask, we expect a section for `deftype` which is Section ID 7 */
-                if (section_id == 7) { /* Explicitly check for Component Type Section (deftype) */
-                     LOG_VERBOSE("Attempting to load Component Type Section (ID 7) for deftypes.\n");
-                     /* This is where the new load_type_section (for deftypes) should be called */
-                     /* if (!load_type_section_for_deftypes(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; */
-                     /* For now, as per previous stubs, we'll just skip and log */
-                      os_printf("Found Component Type Section (ID 7) - deftype (stub).\n");
-                       p += section_size; /* Skip content for now */
-                } else {
-                    os_printf("Skipping unknown component section ID: %u, size: %u\n",
-                              section_id, section_size);
-                    p += section_size;
-                }
+                os_printf("Skipping unknown component section ID: %u, size: %u\n", section_id, section_size);
+                p += section_size; /* Advance pointer for unknown sections */
                 break;
         }
         if (p != section_start + section_size) {
@@ -513,6 +490,22 @@ wasm_component_unload(WASMComponent *component)
         component->core_modules = NULL; /* Avoid double free */
         component->core_module_count = 0;
     }
+    
+    /* Free defined_types if allocated */
+    if (component->defined_types) {
+        /* Add logic here to free individual elements if they contain allocations */
+        wasm_runtime_free(component->defined_types);
+        component->defined_types = NULL;
+        component->defined_type_count = 0;
+    }
+
+    /* Free canonicals if allocated (should be handled by wasm_component_canonical.c if complex, or here if simple) */
+    if (component->canonicals) {
+        /* If options within canonicals had dynamic allocations, free them here or in a dedicated function. */
+        wasm_runtime_free(component->canonicals);
+        component->canonicals = NULL;
+        component->canonical_count = 0;
+    }
 
     /* TODO: Free other allocated resources within the component structure */
     /* Example for future sections:
@@ -527,12 +520,6 @@ wasm_component_unload(WASMComponent *component)
         wasm_runtime_free(component->aliases);
         component->aliases = NULL;
         component->alias_count = 0;
-    }
-    if (component->defined_types) {
-        // ... free defined_types ...
-        wasm_runtime_free(component->defined_types);
-        component->defined_types = NULL;
-        component->defined_type_count = 0;
     }
     */
 
