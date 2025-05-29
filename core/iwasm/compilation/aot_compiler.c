@@ -556,6 +556,12 @@ aot_gen_commit_values(AOTCompFrame *frame)
             case REF_TYPE_I31REF:
             case REF_TYPE_STRUCTREF:
             case REF_TYPE_ARRAYREF:
+#if WASM_ENABLE_STRINGREF != 0
+            case REF_TYPE_STRINGREF:
+            case REF_TYPE_STRINGVIEWWTF8:
+            case REF_TYPE_STRINGVIEWWTF16:
+            case REF_TYPE_STRINGVIEWITER:
+#endif
             case VALUE_TYPE_GC_REF:
                 if (comp_ctx->pointer_size == sizeof(uint64))
                     (++p)->dirty = 0;
@@ -4099,6 +4105,134 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 
     return true;
 }
+
+
+bool
+aot_compile_component(WASMComponent *wasm_component, AOTCompOption *options,
+                      const char *output_dirpath)
+{
+    AOTCompContext *comp_ctx = NULL;
+    AOTCompData *comp_data = NULL;
+    uint32 i;
+    char original_target_filename[1024] = {0};
+    char module_obj_filename[1024] = {0};
+    char module_ll_filename[1024] = {0}; // For LLVM IR output
+
+    if (!wasm_component || !options) {
+        aot_set_last_error("invalid arguments to aot_compile_component.");
+        return false;
+    }
+
+    if (options->target_file) {
+        strncpy(original_target_filename, options->target_file, sizeof(original_target_filename) - 1);
+    } else {
+        // Default output name if not provided (e.g., "a.out" or component name based)
+        // This might need better handling based on how wamrc invokes this.
+        strncpy(original_target_filename, "component_aot", sizeof(original_target_filename) -1);
+    }
+
+    LOG_VERBOSE("Starting AOT compilation for component with %u core modules.",
+                wasm_component->core_module_count);
+
+    for (i = 0; i < wasm_component->core_module_count; i++) {
+        WASMComponentCoreModule *core_module_entry = &wasm_component->core_modules[i];
+        WASMModule *core_wasm_module = core_module_entry->module_object;
+        char module_name_prefix[256];
+
+        if (!core_wasm_module) {
+            aot_set_last_error_v("core module %u in component is not loaded.", i);
+            return false; 
+        }
+
+        // Create a unique prefix for this module's output files
+        // This could be based on an actual module name if available from component, or just index
+        snprintf(module_name_prefix, sizeof(module_name_prefix), "%s_module_%u", 
+                 original_target_filename, i);
+
+        LOG_VERBOSE("Compiling core module %u (%s) from component.", i, module_name_prefix);
+
+        comp_data = aot_create_comp_data(core_wasm_module, options->target_arch, options->gc_enabled);
+        if (!comp_data) {
+            return false; 
+        }
+
+        comp_ctx = aot_create_comp_context(comp_data, options);
+        if (!comp_ctx) {
+            aot_destroy_comp_data(comp_data);
+            return false; 
+        }
+
+        comp_ctx->wasm_component = wasm_component;
+        comp_ctx->is_component_compilation = true;
+        
+        // Set target_file in options for this module if aot_emit_object_file uses it
+        // Or, pass the filename directly to aot_emit_object_file if API allows
+        // For now, assuming aot_emit_object_file takes filename as argument
+        
+        if (!aot_compile_wasm(comp_ctx)) {
+            LOG_ERROR("Failed to compile core module %u (%s) in component: %s", i, module_name_prefix, aot_get_last_error());
+            aot_destroy_comp_context(comp_ctx); 
+            return false; 
+        }
+
+        // Determine output filenames based on output_dirpath and module_name_prefix
+        if (output_dirpath) {
+            snprintf(module_obj_filename, sizeof(module_obj_filename), "%s/%s.o",
+                     output_dirpath, module_name_prefix);
+            if (options->output_format == AOT_LLVMIR_OPT_FILE || options->output_format == AOT_LLVMIR_UNOPT_FILE) {
+                 snprintf(module_ll_filename, sizeof(module_ll_filename), "%s/%s.ll",
+                     output_dirpath, module_name_prefix);
+            }
+        } else { // Fallback to current directory if no output_dirpath
+            snprintf(module_obj_filename, sizeof(module_obj_filename), "%s.o", module_name_prefix);
+             if (options->output_format == AOT_LLVMIR_OPT_FILE || options->output_format == AOT_LLVMIR_UNOPT_FILE) {
+                 snprintf(module_ll_filename, sizeof(module_ll_filename), "%s.ll", module_name_prefix);
+            }
+        }
+
+        if (options->output_format == AOT_OBJECT_FILE) {
+            if (!aot_emit_object_file(comp_ctx, module_obj_filename)) {
+                LOG_ERROR("Failed to emit object file for core module %u (%s): %s", i, module_name_prefix, aot_get_last_error());
+                aot_destroy_comp_context(comp_ctx);
+                return false;
+            }
+            LOG_VERBOSE("Successfully compiled core module %u to %s", i, module_obj_filename);
+        } else if (options->output_format == AOT_LLVMIR_OPT_FILE || options->output_format == AOT_LLVMIR_UNOPT_FILE) {
+            if (!aot_emit_llvm_file(comp_ctx, module_ll_filename)) {
+                 LOG_ERROR("Failed to emit LLVM IR file for core module %u (%s): %s", i, module_name_prefix, aot_get_last_error());
+                aot_destroy_comp_context(comp_ctx);
+                return false;
+            }
+            LOG_VERBOSE("Successfully compiled core module %u to %s", i, module_ll_filename);
+        }
+        // Note: AOT_FORMAT_FILE for components is not handled here yet, would require merging.
+
+        aot_destroy_comp_context(comp_ctx); 
+        comp_ctx = NULL;
+        // comp_data is freed by aot_destroy_comp_context
+    }
+    
+    LOG_VERBOSE("Finished compiling all core modules. Processing canonicals and exports (placeholders).");
+
+    for (i = 0; i < wasm_component->canonical_count; ++i) {
+        WASMComponentCanonical *canon = &wasm_component->canonicals[i];
+        LOG_VERBOSE("Canonical function %u: kind %s, core_func_idx %u, component_func_type_idx %u",
+                    i, canon->func_kind == CANONICAL_FUNC_KIND_LIFT ? "lift" : "lower",
+                    canon->core_func_idx, canon->component_func_type_idx);
+    }
+
+    for (i = 0; i < wasm_component->export_count; ++i) {
+        WASMComponentExport *export_entry = &wasm_component->exports[i];
+        LOG_VERBOSE("Component export %u: name '%s', kind %u, item_idx %u, type_idx %u",
+                    i, export_entry->name, export_entry->kind, export_entry->item_idx, export_entry->optional_desc_type_idx);
+    }
+
+    // TODO: Link individual core module object files and component runtime into a single component AOT file.
+    LOG_VERBOSE("Component AOT compilation (core modules) complete. Linking and wrapper generation are future steps.");
+
+    return true;
+}
+
 
 char *
 aot_generate_tempfile_name(const char *prefix, const char *extension,

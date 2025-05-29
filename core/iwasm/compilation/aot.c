@@ -4,6 +4,10 @@
  */
 
 #include "aot.h"
+#include "aot_compiler.h" /* For aot_compile_component declaration */
+#include "../interpreter/wasm_loader.h" /* For wasm_loader_load_from_buffer */
+#include "../interpreter/wasm_component_loader.h" /* For wasm_component_load and WASMComponent */
+#include "../common/wasm_component.h" /* For component magic numbers */
 
 static char aot_error[128];
 

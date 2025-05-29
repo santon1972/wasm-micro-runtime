@@ -10,6 +10,9 @@
 #include "aot_llvm.h"
 #include "../interpreter/wasm_interp.h"
 #include "../aot/aot_runtime.h"
+/* For WASMComponent */
+#include "../interpreter/wasm_component_loader.h"
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -808,7 +811,7 @@ LLVMIsEfficientConstInt(LLVMValueRef val)
            && LLVMGetValueKind(val) == LLVMConstantIntValueKind
            && !LLVMIsUndef(val)
 #if LLVM_VERSION_NUMBER >= 12
-           && !LLVMIsPoison(addr)
+           && !LLVMIsPoison(val) /* Changed 'addr' to 'val' */
 #endif
         ;
 }
