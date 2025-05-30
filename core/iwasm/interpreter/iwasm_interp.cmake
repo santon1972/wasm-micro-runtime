@@ -25,5 +25,10 @@ file (GLOB_RECURSE source_all
     ${IWASM_INTERP_DIR}/${INTERPRETER}
 )
 
+list(APPEND source_all
+    ${IWASM_INTERP_DIR}/wasm_component_loader.c
+    ${IWASM_INTERP_DIR}/wasm_component_canonical.c
+)
+
 set (IWASM_INTERP_SOURCE ${source_all})
 

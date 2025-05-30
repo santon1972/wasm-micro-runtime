@@ -10,9 +10,11 @@
 extern "C" {
 #endif
 
-/* WASM Component Model Preamble */
-#define COMPONENT_MODEL_VERSION_0D 0x000D
-#define COMPONENT_MODEL_LAYER_01   0x0001
+/* WASM Component Model Preamble (Version 1.0) */
+/* Corresponds to the 'primary' version in the Component Model 1.0 spec */
+#define COMPONENT_MODEL_VERSION_PRIMARY 0x01
+/* Corresponds to the 'primary' layer in the Component Model 1.0 spec */
+#define COMPONENT_MODEL_LAYER_PRIMARY   0x01
 
 #ifdef __cplusplus
 } /* end of extern "C" */

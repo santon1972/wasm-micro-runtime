@@ -16,29 +16,22 @@ extern "C" {
 /* Forward declaration */
 struct WASMComponent;
 
-/* Section Type IDs for Component Model (from Binary.md) */
-#define COMPONENT_SECTION_ID_CORE_MODULE    0
-#define COMPONENT_SECTION_ID_CORE_INSTANCE  1
-#define COMPONENT_SECTION_ID_CORE_TYPE      2
-#define COMPONENT_SECTION_ID_COMPONENT      3
-#define COMPONENT_SECTION_ID_INSTANCE       4
-#define COMPONENT_SECTION_ID_ALIAS          5
-#define COMPONENT_SECTION_ID_TYPE           6  /* Defines types available for reference, populates component->type_definitions */
-#define COMPONENT_SECTION_ID_DEFINED_TYPE   7  /* Defines component types, func types, value types, etc., populates component->component_type_definitions */
-#define COMPONENT_SECTION_ID_CANONICAL      8
-#define COMPONENT_SECTION_ID_START          9
-#define COMPONENT_SECTION_ID_IMPORT         10
-#define COMPONENT_SECTION_ID_EXPORT         11
-/* Custom section ID is 0 for core wasm, but component custom sections
-   are distinct. The spec does not assign a generic custom section ID for components in the same way.
-   The "value" section mentioned in some drafts (e.g. with ID 11) is not in the final binary spec's section list.
-   For now, I'll assume specific sections as listed.
-   If there's a generic component custom section, its ID would be different
-   from core WASM's custom section ID.
-   The "Value Section" is not explicitly listed with an ID in Binary.md's
-   section overview, but is described later. I'll hold off on this one
-   until I have more clarity or if it's part of another section's parsing.
-*/
+/* Section Type IDs for Component Model (Component Model 1.0 Spec) */
+/* Custom section ID is 0 (same as core WASM) */
+#define COMPONENT_SECTION_ID_CORE_MODULE    1  /* MVP Spec: core module */
+#define COMPONENT_SECTION_ID_CORE_INSTANCE  2  /* MVP Spec: core instance */
+#define COMPONENT_SECTION_ID_CORE_TYPE      3  /* MVP Spec: core type */
+#define COMPONENT_SECTION_ID_COMPONENT      4  /* MVP Spec: component */
+#define COMPONENT_SECTION_ID_INSTANCE       5  /* MVP Spec: instance */
+#define COMPONENT_SECTION_ID_ALIAS          6  /* MVP Spec: alias */
+#define COMPONENT_SECTION_ID_TYPE           7  /* MVP Spec: type (defines all component types: functype, componenttype, instancetype, resourcetype, valtype) */
+                                               /* This merges WAMR's previous ID 6 and 7 */
+#define COMPONENT_SECTION_ID_CANONICAL      8  /* MVP Spec: canonical function */
+#define COMPONENT_SECTION_ID_START          9  /* MVP Spec: start function */
+#define COMPONENT_SECTION_ID_IMPORT         10 /* MVP Spec: import */
+#define COMPONENT_SECTION_ID_EXPORT         11 /* MVP Spec: export */
+#define COMPONENT_SECTION_ID_VALUE          12 /* MVP Spec: value section (for constant values) */
+/* Note: COMPONENT_SECTION_ID_DEFINED_TYPE (WAMR's old 7) is removed, functionality merged into COMPONENT_SECTION_ID_TYPE (new 7) */
 
 
 /* Structure for a Core Module Section item */
@@ -177,21 +170,21 @@ typedef struct WASMComponentInstance {
     WASMComponentInstanceArg *args;
 } WASMComponentInstance;
 
-/* Primitive Value Types */
+/* Primitive Value Types (Component Model 1.0 Spec Tags) */
 typedef enum WASMComponentPrimValType {
-    PRIM_VAL_BOOL,
-    PRIM_VAL_S8,
-    PRIM_VAL_U8,
-    PRIM_VAL_S16,
-    PRIM_VAL_U16,
-    PRIM_VAL_S32,
-    PRIM_VAL_U32,
-    PRIM_VAL_S64,
-    PRIM_VAL_U64,
-    PRIM_VAL_F32,
-    PRIM_VAL_F64,
-    PRIM_VAL_CHAR,
-    PRIM_VAL_STRING
+    PRIM_VAL_BOOL   = 0x7f, /* bool */
+    PRIM_VAL_S8     = 0x7e, /* s8 */
+    PRIM_VAL_U8     = 0x7d, /* u8 */
+    PRIM_VAL_S16    = 0x7c, /* s16 */
+    PRIM_VAL_U16    = 0x7b, /* u16 */
+    PRIM_VAL_S32    = 0x7a, /* s32 */
+    PRIM_VAL_U32    = 0x79, /* u32 */
+    PRIM_VAL_S64    = 0x78, /* s64 */
+    PRIM_VAL_U64    = 0x77, /* u64 */
+    PRIM_VAL_F32    = 0x76, /* f32 */
+    PRIM_VAL_F64    = 0x75, /* f64 */
+    PRIM_VAL_CHAR   = 0x74, /* char */
+    PRIM_VAL_STRING = 0x73  /* string */
 } WASMComponentPrimValType;
 
 /* Forward declaration for recursive ValType */
@@ -237,19 +230,35 @@ typedef struct WASMComponentEnumType {
     char **labels;
 } WASMComponentEnumType;
 
+/* Defines the internal kind of a WASMComponentValType.
+ * The loader maps Component Model 1.0 spec binary opcodes to these kinds.
+ * Spec opcodes for `deftype` kinds that these map to:
+ *   Record:   0x72
+ *   Variant:  0x71
+ *   List:     0x70 (Note: spec also has fixed-size list 0x67)
+ *   Tuple:    0x6f
+ *   Flags:    0x6e
+ *   Enum:     0x6d
+ *   Option:   0x6b
+ *   Result:   0x6a
+ *   Own:      0x69 (typeidx)
+ *   Borrow:   0x68 (typeidx)
+ * Primitive types (bool, s8, etc.) have their own direct tags (0x7f-0x73).
+ * VAL_TYPE_KIND_TYPE_IDX is for internal references to already defined types.
+ */
 typedef enum WASMComponentValTypeKind {
-    VAL_TYPE_KIND_PRIMITIVE,
-    VAL_TYPE_KIND_RECORD,
-    VAL_TYPE_KIND_VARIANT,
-    VAL_TYPE_KIND_LIST,
-    VAL_TYPE_KIND_TUPLE,
-    VAL_TYPE_KIND_FLAGS,
-    VAL_TYPE_KIND_ENUM,
-    VAL_TYPE_KIND_OPTION,
-    VAL_TYPE_KIND_RESULT,
-    VAL_TYPE_KIND_OWN_TYPE_IDX,    /* Own a resource, stores typeidx to a resource type definition */
-    VAL_TYPE_KIND_BORROW_TYPE_IDX, /* Borrow a resource, stores typeidx to a resource type definition */
-    VAL_TYPE_KIND_TYPE_IDX         /* Reference to another defined type (valtype) in a type section */
+    VAL_TYPE_KIND_PRIMITIVE,       /* Corresponds to PRIM_VAL_* tags */
+    VAL_TYPE_KIND_RECORD,          /* Parsed from spec opcode 0x72 */
+    VAL_TYPE_KIND_VARIANT,         /* Parsed from spec opcode 0x71 */
+    VAL_TYPE_KIND_LIST,            /* Parsed from spec opcode 0x70 */
+    VAL_TYPE_KIND_TUPLE,           /* Parsed from spec opcode 0x6f */
+    VAL_TYPE_KIND_FLAGS,           /* Parsed from spec opcode 0x6e */
+    VAL_TYPE_KIND_ENUM,            /* Parsed from spec opcode 0x6d */
+    VAL_TYPE_KIND_OPTION,          /* Parsed from spec opcode 0x6b */
+    VAL_TYPE_KIND_RESULT,          /* Parsed from spec opcode 0x6a */
+    VAL_TYPE_KIND_OWN_TYPE_IDX,    /* Parsed from spec opcode 0x69, stores typeidx to a resource type */
+    VAL_TYPE_KIND_BORROW_TYPE_IDX, /* Parsed from spec opcode 0x68, stores typeidx to a resource type */
+    VAL_TYPE_KIND_TYPE_IDX         /* Reference to another defined type (valtype) in a type section (internal use) */
 } WASMComponentValTypeKind;
 
 typedef struct WASMComponentOptionType {
@@ -329,11 +338,14 @@ struct WASMComponentComponentType;
 struct WASMComponentInstanceType;
 struct WASMComponentResourceType;
 
-/* Represents a component function type */
+/* Represents a component function type.
+ * Spec `functype`: paramlist:<labelvaltype*> resultlist:(0x00 <valtype> | 0x01 0x00)
+ * WAMR's result representation needs to align with this encoding during load/unload.
+ */
 typedef struct WASMComponentFuncType {
     uint32 param_count;
     WASMComponentLabelValType *params; /* <label, valtype> pairs */
-    WASMComponentValType *result;      /* valtype for the result. VOID represented by a specific valtype or NULL */
+    WASMComponentValType *result;      /* valtype for the result. NULL if spec is (0x01 0x00) for no result. */
 } WASMComponentFuncType;
 
 /* Represents a resource type definition */
@@ -378,14 +390,28 @@ typedef enum WASMComponentExternDescKind {
     EXTERN_DESC_KIND_COMPONENT = 0x05
 } WASMComponentExternDescKind;
 
+/* Represents a type bound in an export or import description.
+ * Spec `typebound`: 0x00 <typeidx> (eq) | 0x01 (sub resource)
+ * WAMR's current structure needs review for full alignment.
+ * For 'sub resource', the type_idx would implicitly refer to the resource being subtyped,
+ * which might require context from the outer type declaration.
+ */
 typedef enum WASMComponentTypeBoundKind {
-    TYPE_BOUND_KIND_EQ = 0x00,
-    TYPE_BOUND_KIND_SUB_RESOURCE = 0x01
+    TYPE_BOUND_KIND_EQ = 0x00,           /* Corresponds to spec 0x00 <typeidx> (type equal) */
+    TYPE_BOUND_KIND_SUB_RESOURCE = 0x01  /* Corresponds to spec 0x01 (subtype of a resource) */
 } WASMComponentTypeBoundKind;
 
 typedef struct WASMComponentTypeBound {
     WASMComponentTypeBoundKind kind;
-    uint32 type_idx; /* type_idx for both EQ and SUB_RESOURCE (resource type index) */
+    /* For TYPE_BOUND_KIND_EQ: `type_idx` is the index of the type it must be equal to.
+     * For TYPE_BOUND_KIND_SUB_RESOURCE: The spec `(sub resource)` defines a new abstract resource type
+     * that is a subtype of the (implied) resource capabilities of the containing type.
+     * The `type_idx` field is not directly used by the `(sub resource)` production itself
+     * in the spec. If the parser stores an outer resource type index here for context,
+     * the loader must be aware. For a standalone `(sub resource)` defining a fresh type,
+     * this field might be unused or set to a sentinel by the parser.
+     */
+    uint32 type_idx;
 } WASMComponentTypeBound;
 
 typedef struct WASMComponentExternDesc {
@@ -481,18 +507,21 @@ struct WASMComponentInstanceType {
     WASMComponentInstanceTypeDecl *decls; /* Exports, Aliases, Type definitions */
 };
 
-/* Canonical Function Options */
+/* Canonical Function Options (Component Model 1.0 Spec opcodes) */
 typedef enum WASMComponentCanonicalOptionKind {
-    CANONICAL_OPTION_STRING_ENCODING_UTF8 = 0x00,
-    CANONICAL_OPTION_STRING_ENCODING_UTF16 = 0x01,
-    CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16 = 0x02, // New
-    CANONICAL_OPTION_STRING_ENCODING_COMPACT_UTF16 = 0x03, // Value was 0x02, now 0x03
-    CANONICAL_OPTION_MEMORY_IDX = 0x04,    /* value is core memory index */
-    CANONICAL_OPTION_REALLOC_FUNC_IDX = 0x05, /* value is core func index for realloc */
-    CANONICAL_OPTION_POST_RETURN_FUNC_IDX = 0x06, /* value is core func index for post-return */
-    CANONICAL_OPTION_ASYNC = 0x07, /* No value, indicates async behavior. Value was 0x06 in problem, made 0x07 to avoid clash */
-    CANONICAL_OPTION_CALLBACK_FUNC_IDX = 0x08, /* value is func_idx. Value was 0x07 in problem, made 0x08 */
-    CANONICAL_OPTION_ALWAYS_TASK_RETURN = 0x09 /* No value. Value was 0x08 in problem, made 0x09 */
+    CANONICAL_OPTION_STRING_ENCODING_UTF8       = 0x00, /* string-encoding=utf8 */
+    CANONICAL_OPTION_STRING_ENCODING_UTF16      = 0x01, /* string-encoding=utf16 */
+    CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16 = 0x02, /* string-encoding=latin1+utf16 */
+    /* CANONICAL_OPTION_STRING_ENCODING_COMPACT_UTF16 (WAMR specific, 0x03) removed as not in MVP spec */
+    CANONICAL_OPTION_MEMORY_IDX                 = 0x03, /* memory <memidx> */
+    CANONICAL_OPTION_REALLOC_FUNC_IDX           = 0x04, /* realloc <funcidx> */
+    CANONICAL_OPTION_POST_RETURN_FUNC_IDX       = 0x05, /* post-return <funcidx> */
+    CANONICAL_OPTION_ASYNC                      = 0x06, /* async (no value) */
+    CANONICAL_OPTION_CALLBACK_FUNC_IDX          = 0x07, /* callback <funcidx> */
+    CANONICAL_OPTION_ALWAYS_TASK_RETURN         = 0x08  /* always-task-return (no value) */
+    /* WAMR's previous CANONICAL_OPTION_ASYNC (0x07), CALLBACK_FUNC_IDX (0x08), ALWAYS_TASK_RETURN (0x09)
+       are now mapped to spec 0x06, 0x07, 0x08 respectively.
+    */
 } WASMComponentCanonicalOptionKind;
 
 typedef struct WASMComponentCanonicalOption {
@@ -500,47 +529,61 @@ typedef struct WASMComponentCanonicalOption {
     uint32 value; /* For idx options, ignored for options without a value */
 } WASMComponentCanonicalOption;
 
-/* Structure for a Canonical Section item (Canonical ABI functions) */
+/* Structure for a Canonical Section item (Canonical ABI functions)
+ * The loader maps Component Model 1.0 spec binary opcodes to these kinds.
+ * Spec opcodes:
+ *   lift:                      0x00 (func <corefuncidx> (options <canonopt*>) <typeidx>)
+ *   lower:                     0x01 (func <funcidx> (options <canonopt*>))
+ *   resource.new:              0x02 (resource <typeidx>)
+ *   resource.drop:             0x03 (resource <typeidx>)
+ *   resource.rep:              0x04 (resource <typeidx>)
+ *   (Spec has other canonical functions related to async, tasks, streams, etc.
+ *    These will be mapped to WAMR's internal kinds as needed.
+ *    The list below is WAMR's current internal set of kinds.)
+ */
 typedef enum WASMCanonicalFuncKind {
-    CANONICAL_FUNC_KIND_LIFT = 0x00, // lift (core_func_idx, options, component_func_type_idx)
-    CANONICAL_FUNC_KIND_LOWER = 0x01, // lower (component_func_idx, options) -> core func
-    CANONICAL_FUNC_KIND_RESOURCE_NEW = 0x02,      // resource.new (resource_type_idx) -> core func
-    CANONICAL_FUNC_KIND_RESOURCE_DROP = 0x03,     // resource.drop (resource_type_idx) -> core func
-    CANONICAL_FUNC_KIND_RESOURCE_REP = 0x04,      // resource.rep (resource_type_idx) -> core func
-    CANONICAL_FUNC_KIND_TASK_CANCEL = 0x05,       // task.cancel -> core func
-    CANONICAL_FUNC_KIND_SUBTASK_CANCEL = 0x06,    // subtask.cancel -> core func
-    CANONICAL_FUNC_KIND_RESOURCE_DROP_ASYNC = 0x07, // resource.drop async (resource_type_idx) -> core func
-    CANONICAL_FUNC_KIND_BACKPRESSURE_SET = 0x08,  // backpressure.set -> core func
-    CANONICAL_FUNC_KIND_TASK_RETURN = 0x09,       // task.return (opts) -> core func
-    CANONICAL_FUNC_KIND_CONTEXT_GET = 0x0A,       // context.get i32 (idx) -> core func
-    CANONICAL_FUNC_KIND_CONTEXT_SET = 0x0B,       // context.set i32 (idx) -> core func
-    CANONICAL_FUNC_KIND_YIELD = 0x0C,             // yield -> core func
-    CANONICAL_FUNC_KIND_SUBTASK_DROP = 0x0D,      // subtask.drop -> core func
-    CANONICAL_FUNC_KIND_STREAM_NEW = 0x0E,        // stream.new (type_idx) -> core func
-    CANONICAL_FUNC_KIND_STREAM_READ = 0x0F,       // stream.read (type_idx, opts) -> core func
-    CANONICAL_FUNC_KIND_STREAM_WRITE = 0x10,      // stream.write (type_idx, opts) -> core func
-    CANONICAL_FUNC_KIND_STREAM_CANCEL_READ = 0x11, // stream.cancel-read (type_idx) -> core func
-    CANONICAL_FUNC_KIND_STREAM_CANCEL_WRITE = 0x12, // stream.cancel-write (type_idx) -> core func
-    CANONICAL_FUNC_KIND_STREAM_CLOSE_READABLE = 0x13, // stream.close-readable (type_idx) -> core func
-    CANONICAL_FUNC_KIND_STREAM_CLOSE_WRITABLE = 0x14, // stream.close-writable (type_idx) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_NEW = 0x15,        // future.new (type_idx) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_READ = 0x16,       // future.read (type_idx, opts) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_WRITE = 0x17,      // future.write (type_idx, opts) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_CANCEL_READ = 0x18, // future.cancel-read (type_idx) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_CANCEL_WRITE = 0x19, // future.cancel-write (type_idx) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_CLOSE_READABLE = 0x1A, // future.close-readable (type_idx) -> core func
-    CANONICAL_FUNC_KIND_FUTURE_CLOSE_WRITABLE = 0x1B, // future.close-writable (type_idx) -> core func
-    CANONICAL_FUNC_KIND_ERROR_CONTEXT_NEW = 0x1C, // error-context.new (opts) -> core func
-    CANONICAL_FUNC_KIND_ERROR_CONTEXT_DEBUG_MESSAGE = 0x1D, // error-context.debug-message (opts) -> core func
-    CANONICAL_FUNC_KIND_ERROR_CONTEXT_DROP = 0x1E, // error-context.drop -> core func
-    CANONICAL_FUNC_KIND_WAITABLE_SET_NEW = 0x1F,  // waitable-set.new -> core func
-    CANONICAL_FUNC_KIND_WAITABLE_SET_WAIT = 0x20, // waitable-set.wait (async?, memidx, opts) -> core func
-    CANONICAL_FUNC_KIND_WAITABLE_SET_POLL = 0x21, // waitable-set.poll (async?, memidx, opts) -> core func
-    CANONICAL_FUNC_KIND_WAITABLE_SET_DROP = 0x22, // waitable-set.drop -> core func
-    CANONICAL_FUNC_KIND_WAITABLE_JOIN = 0x23,     // waitable.join -> core func
-    CANONICAL_FUNC_KIND_THREAD_SPAWN_REF = 0x40,  // thread.spawn_ref (typeidx, opts) -> core func
-    CANONICAL_FUNC_KIND_THREAD_SPAWN_INDIRECT = 0x41, // thread.spawn_indirect (typeidx, tableidx, opts) -> core func
-    CANONICAL_FUNC_KIND_THREAD_AVAILABLE_PARALLELISM = 0x42 // thread.available_parallelism (opts) -> core func
+    CANONICAL_FUNC_KIND_LIFT = 0x00,        // Spec: 0x00 lift
+    CANONICAL_FUNC_KIND_LOWER = 0x01,       // Spec: 0x01 lower
+    CANONICAL_FUNC_KIND_RESOURCE_NEW = 0x02,  // Spec: 0x02 resource.new
+    CANONICAL_FUNC_KIND_RESOURCE_DROP = 0x03, // Spec: 0x03 resource.drop
+    CANONICAL_FUNC_KIND_RESOURCE_REP = 0x04,  // Spec: 0x04 resource.rep
+    /* The following are WAMR-specific extensions or pre-spec versions.
+       They will need mapping if they correspond to new spec canonical functions.
+       For now, keeping them as internal kinds. The loader must handle this. */
+    CANONICAL_FUNC_KIND_TASK_CANCEL = 0x05,
+    CANONICAL_FUNC_KIND_SUBTASK_CANCEL = 0x06,
+    CANONICAL_FUNC_KIND_RESOURCE_DROP_ASYNC = 0x07,
+    CANONICAL_FUNC_KIND_BACKPRESSURE_SET = 0x08,
+    CANONICAL_FUNC_KIND_TASK_RETURN = 0x09,
+    CANONICAL_FUNC_KIND_CONTEXT_GET = 0x0A,
+    CANONICAL_FUNC_KIND_CONTEXT_SET = 0x0B,
+    CANONICAL_FUNC_KIND_YIELD = 0x0C,
+    CANONICAL_FUNC_KIND_SUBTASK_DROP = 0x0D,
+    CANONICAL_FUNC_KIND_STREAM_NEW = 0x0E,
+    CANONICAL_FUNC_KIND_STREAM_READ = 0x0F,
+    CANONICAL_FUNC_KIND_STREAM_WRITE = 0x10,
+    CANONICAL_FUNC_KIND_STREAM_CANCEL_READ = 0x11,
+    CANONICAL_FUNC_KIND_STREAM_CANCEL_WRITE = 0x12,
+    CANONICAL_FUNC_KIND_STREAM_CLOSE_READABLE = 0x13,
+    CANONICAL_FUNC_KIND_STREAM_CLOSE_WRITABLE = 0x14,
+    CANONICAL_FUNC_KIND_FUTURE_NEW = 0x15,
+    CANONICAL_FUNC_KIND_FUTURE_READ = 0x16,
+    CANONICAL_FUNC_KIND_FUTURE_WRITE = 0x17,
+    CANONICAL_FUNC_KIND_FUTURE_CANCEL_READ = 0x18,
+    CANONICAL_FUNC_KIND_FUTURE_CANCEL_WRITE = 0x19,
+    CANONICAL_FUNC_KIND_FUTURE_CLOSE_READABLE = 0x1A,
+    CANONICAL_FUNC_KIND_FUTURE_CLOSE_WRITABLE = 0x1B,
+    CANONICAL_FUNC_KIND_ERROR_CONTEXT_NEW = 0x1C,
+    CANONICAL_FUNC_KIND_ERROR_CONTEXT_DEBUG_MESSAGE = 0x1D,
+    CANONICAL_FUNC_KIND_ERROR_CONTEXT_DROP = 0x1E,
+    CANONICAL_FUNC_KIND_WAITABLE_SET_NEW = 0x1F,
+    CANONICAL_FUNC_KIND_WAITABLE_SET_WAIT = 0x20,
+    CANONICAL_FUNC_KIND_WAITABLE_SET_POLL = 0x21,
+    CANONICAL_FUNC_KIND_WAITABLE_SET_DROP = 0x22,
+    CANONICAL_FUNC_KIND_WAITABLE_JOIN = 0x23,
+    CANONICAL_FUNC_KIND_THREAD_SPAWN_REF = 0x40,
+    CANONICAL_FUNC_KIND_THREAD_SPAWN_INDIRECT = 0x41,
+    CANONICAL_FUNC_KIND_THREAD_AVAILABLE_PARALLELISM = 0x42
 } WASMCanonicalFuncKind;
 
 typedef struct WASMComponentCanonical {
@@ -645,19 +688,22 @@ typedef struct WASMComponent {
     WASMComponentInstance *component_instances;     /* Section ID 4: component instances */
     uint32 component_instance_count;
 
-    WASMComponentAlias *aliases;                    /* Section ID 5: aliases */
+    WASMComponentAlias *aliases;                    /* Section ID 6 (Spec): aliases */
     uint32 alias_count;
 
-    WASMComponentDefinedType *type_definitions;     /* Section ID 6: type definitions (functype, componenttype, etc.) */
-    uint32 type_definition_count;
+    /* Section ID 7 (Spec): Unified type definitions for all component-level types
+     * (functype, componenttype, instancetype, resourcetype, valtype, etc.).
+     * This single list now holds all types previously split between
+     * WAMR's old 'type_definitions' (section 6) and 'component_type_definitions' (section 7).
+     * The kind field within WASMComponentDefinedType distinguishes the specific type.
+     */
+    WASMComponentDefinedType *type_definitions;     /* All component-level type definitions */
+    uint32 type_definition_count;                   /* Count for all type_definitions */
 
-    WASMComponentDefinedType *component_type_definitions; /* Section ID 7: component type definitions */
-    uint32 component_type_definition_count;         /* (Structure is same as type_definitions, but from a different section for component-specific types) */
-
-    WASMComponentCanonical *canonicals;             /* Section ID 8: canonical functions */
+    WASMComponentCanonical *canonicals;             /* Section ID 8 (Spec): canonical functions */
     uint32 canonical_count;
 
-    WASMComponentStart *starts;                     /* Section ID 9: start functions */
+    WASMComponentStart *starts;                     /* Section ID 9 (Spec): start functions */
     uint32 start_count;
 
     WASMComponentImport *imports;                   /* Section ID 10: imports */

@@ -309,10 +309,18 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                     if (!parse_string(&p, buf_end, &arg->name, error_buf, error_buf_size)) {
                         goto fail;
                     }
+                    
+                    uint8 parsed_sort_byte;
+                    CHECK_BUF(p, buf_end, 1);
+                    parsed_sort_byte = *p++;
+                    // arg->kind will store this parsed sort byte.
+                    // The derivation logic later will validate it against the module import.
+                    arg->kind = parsed_sort_byte; 
+
                     read_leb_uint32(p, buf_end, arg->instance_idx);
 
-                    LOG_VERBOSE("Deriving kind for core instance arg '%s' (idx %u for module %u)",
-                                arg->name, j, current_instance->u.instantiate.module_idx);
+                    LOG_VERBOSE("Parsed core instance arg '%s', sort 0x%02X, item_idx %u. Validating against module %u import.",
+                                arg->name, arg->kind, arg->instance_idx, current_instance->u.instantiate.module_idx);
 
                     uint32 target_module_idx = current_instance->u.instantiate.module_idx;
                     if (target_module_idx >= component->core_module_count) {
@@ -330,27 +338,35 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                         goto fail;
                     }
 
-                    bool kind_derived = false;
+                    bool import_found = false;
+                    uint8 expected_kind = 0xFF; // Invalid kind
                     for (uint32 k = 0; k < module_object->import_count; k++) {
                         WASMImport *core_import = &module_object->imports[k];
                         if (core_import->field_name != NULL && strcmp(core_import->field_name, arg->name) == 0) {
-                            arg->kind = core_import->kind;
-                            kind_derived = true;
-                            LOG_VERBOSE("Derived kind for arg '%s' as %u from module import '%s':'%s'",
-                                        arg->name, arg->kind, core_import->module_name, core_import->field_name);
+                            expected_kind = core_import->kind;
+                            import_found = true;
+                            LOG_VERBOSE("Found import '%s' in module, expected kind %u, parsed kind %u.",
+                                        arg->name, expected_kind, arg->kind);
                             break;
                         }
                     }
 
-                    if (!kind_derived) {
+                    if (!import_found) {
                         set_error_buf_v(error_buf, error_buf_size,
-                                        "import '%s' not found in target module %u for kind derivation",
+                                        "import '%s' not found in target module %u for validation",
                                         arg->name, target_module_idx);
                         goto fail;
                     }
 
-                    // New Validation Logic: Check source instance and match export
-                    LOG_VERBOSE("Validating source of instance arg '%s' (instance_idx %u)", arg->name, arg->instance_idx);
+                    if (arg->kind != expected_kind) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "parsed sort byte 0x%02X for arg '%s' does not match expected import kind 0x%02X",
+                                        arg->kind, arg->name, expected_kind);
+                        goto fail;
+                    }
+
+                    // Validation Logic: Check source instance and match export
+                    LOG_VERBOSE("Validating source of instance arg '%s' (instance_idx %u, kind %u)", arg->name, arg->instance_idx, arg->kind);
                     if (arg->instance_idx >= component->core_instance_count) {
                         set_error_buf_v(error_buf, error_buf_size,
                                         "source core instance index %u out of bounds for argument '%s'",
@@ -719,8 +735,18 @@ load_instance_section(const uint8 **p_buf, const uint8 *buf_end, /* Component In
                 if (!parse_string(&p, buf_end, &arg->name, error_buf, error_buf_size)) {
                     goto fail;
                 }
+                // Spec: <itemidx> is s:<sort> idx:<u32>
+                // The <sort> byte indicates the kind of the item being instanced (func, value, type, etc.)
+                uint8 item_sort_byte;
+                CHECK_BUF(p, buf_end, 1);
+                item_sort_byte = *p++;
+                // TODO: Store and use item_sort_byte for validation. For now, just log it.
+                // arg->kind is WAMR's internal INSTANCE_ARG_KIND_*, not the component model <sort>.
+                
                 read_leb_uint32(p, buf_end, arg->item_idx);
                 arg->kind = INSTANCE_ARG_KIND_ITEM_IDX; 
+                LOG_VERBOSE("  Arg %u: name '%s', parsed_sort 0x%02X, item_idx %u (WAMR kind %u)",
+                            j, arg->name, item_sort_byte, arg->item_idx, arg->kind);
             }
         }
         LOG_VERBOSE("Instance %u: kind %s, item_idx %u, arg_count %u", i,
@@ -824,14 +850,14 @@ load_type_section(const uint8 **p_buf, const uint8 *buf_end, /* Type Section ID 
     uint32 type_def_count, i;
 
     read_leb_uint32(p, buf_end, type_def_count);
-    LOG_VERBOSE("Component Type section (ID 6) with %u type definitions.", type_def_count);
+    LOG_VERBOSE("Component Type section (Spec ID 7) with %u type definitions.", type_def_count);
 
     if (type_def_count == 0) {
         *p_buf = p;
         return true;
     }
     if (component->type_definitions) {
-        set_error_buf(error_buf, error_buf_size, "duplicate type section (ID 6)");
+        set_error_buf(error_buf, error_buf_size, "duplicate type section (Spec ID 7)");
         goto fail;
     }
     component->type_definitions = loader_malloc(
@@ -843,7 +869,7 @@ load_type_section(const uint8 **p_buf, const uint8 *buf_end, /* Type Section ID 
     memset(component->type_definitions, 0, type_def_count * sizeof(WASMComponentDefinedType));
 
     for (i = 0; i < type_def_count; i++) {
-        LOG_VERBOSE("Parsing type definition %u in Type Section (ID 6)", i);
+        LOG_VERBOSE("Parsing type definition %u in Type Section (Spec ID 7)", i);
         if (!parse_defined_type_entry(&p, buf_end, &component->type_definitions[i],
                                       error_buf, error_buf_size)) {
             goto fail;
@@ -856,48 +882,10 @@ fail:
     return false;
 }
 
-static bool
-load_component_defined_type_section(const uint8 **p_buf, const uint8 *buf_end, /* Component Type Section ID 7 */
-                                   WASMComponent *component,
-                                   char *error_buf, uint32 error_buf_size)
-{
-    const uint8 *p = *p_buf;
-    uint32 comp_type_def_count, i;
-
-    read_leb_uint32(p, buf_end, comp_type_def_count);
-    LOG_VERBOSE("Component Defined Type section (ID 7) with %u definitions.", comp_type_def_count);
-
-    if (comp_type_def_count == 0) {
-        *p_buf = p;
-        return true;
-    }
-    /* This field in WASMComponent is component_type_definitions as per .h */
-    if (component->component_type_definitions) {
-        set_error_buf(error_buf, error_buf_size, "duplicate component defined type section (ID 7)");
-        goto fail;
-    }
-    component->component_type_definitions = loader_malloc(
-        comp_type_def_count * sizeof(WASMComponentDefinedType), error_buf, error_buf_size);
-    if (!component->component_type_definitions) {
-        goto fail;
-    }
-    component->component_type_definition_count = comp_type_def_count;
-    memset(component->component_type_definitions, 0, comp_type_def_count * sizeof(WASMComponentDefinedType));
-
-    for (i = 0; i < comp_type_def_count; i++) {
-        LOG_VERBOSE("Parsing defined type %u in Component Defined Type Section (ID 7)", i);
-        if (!parse_defined_type_entry(&p, buf_end, &component->component_type_definitions[i],
-                                      error_buf, error_buf_size)) {
-            goto fail;
-        }
-    }
-
-    *p_buf = p;
-    return true;
-fail:
-    return false;
-}
-
+/* Function load_component_defined_type_section (old handler for WAMR ID 7) removed.
+   Its logic is now covered by load_type_section (new ID 7) which populates
+   component->type_definitions.
+*/
 
 /* ========================================================================== */
 /* START: Type Parsing Logic                                                */
@@ -920,24 +908,24 @@ static void free_defined_type_contents(WASMComponentDefinedType *defined_type);
 static WASMComponentPrimValType
 map_binary_primitive_to_enum(uint8 binary_tag, bool *success) {
     *success = true;
-    // Based on Binary.md `primitive-valtype`
+    // Component Model 1.0 Spec `primvaltype` tags
     switch (binary_tag) {
-        case 0x7B: return PRIM_VAL_BOOL;
-        case 0x7A: return PRIM_VAL_S8;
-        case 0x79: return PRIM_VAL_U8;
-        case 0x78: return PRIM_VAL_S16;
-        case 0x77: return PRIM_VAL_U16;
-        case 0x76: return PRIM_VAL_S32;
-        case 0x75: return PRIM_VAL_U32;
-        case 0x74: return PRIM_VAL_S64;
-        case 0x73: return PRIM_VAL_U64;
-        case 0x72: return PRIM_VAL_F32;
-        case 0x71: return PRIM_VAL_F64;
-        case 0x70: return PRIM_VAL_CHAR;
-        case 0x6F: return PRIM_VAL_STRING; // Spec uses 0x6F for string
+        case 0x7f: return PRIM_VAL_BOOL;
+        case 0x7e: return PRIM_VAL_S8;
+        case 0x7d: return PRIM_VAL_U8;
+        case 0x7c: return PRIM_VAL_S16;
+        case 0x7b: return PRIM_VAL_U16;
+        case 0x7a: return PRIM_VAL_S32;
+        case 0x79: return PRIM_VAL_U32;
+        case 0x78: return PRIM_VAL_S64;
+        case 0x77: return PRIM_VAL_U64;
+        case 0x76: return PRIM_VAL_F32;
+        case 0x75: return PRIM_VAL_F64;
+        case 0x74: return PRIM_VAL_CHAR;
+        case 0x73: return PRIM_VAL_STRING;
         default:
             *success = false;
-            return (WASMComponentPrimValType)0; /* Invalid */
+            return (WASMComponentPrimValType)0; /* Invalid - Ensure PRIM_VAL_BOOL is not 0 if 0 is a valid tag */
     }
 }
 
@@ -955,25 +943,38 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
     tag = *p++; // Consume the valtype tag
     memset(valtype, 0, sizeof(WASMComponentValType));
 
-    // Binary.md `valtype` encoding
+    // Binary.md `valtype` encoding, now using Component Model 1.0 Spec tags
     switch (tag) {
-        // Primitive types 0x7B down to 0x6F
-        case 0x7B: case 0x7A: case 0x79: case 0x78: case 0x77: case 0x76:
-        case 0x75: case 0x74: case 0x73: case 0x72: case 0x71: case 0x70: case 0x6F:
+        // Primitive types (Component Model 1.0 Spec: 0x7f down to 0x73)
+        case 0x7f: /* bool */
+        case 0x7e: /* s8 */
+        case 0x7d: /* u8 */
+        case 0x7c: /* s16 */
+        case 0x7b: /* u16 */
+        case 0x7a: /* s32 */
+        case 0x79: /* u32 */
+        case 0x78: /* s64 */
+        case 0x77: /* u64 */
+        case 0x76: /* f32 */
+        case 0x75: /* f64 */
+        case 0x74: /* char */
+        case 0x73: /* string */
             valtype->kind = VAL_TYPE_KIND_PRIMITIVE;
             valtype->u.primitive = map_binary_primitive_to_enum(tag, &map_success);
             if (!map_success) {
-                set_error_buf_v(error_buf, error_buf_size, "unknown primitive valtype tag 0x%02X", tag);
+                // This should ideally not be reached if cases match map_binary_primitive_to_enum
+                set_error_buf_v(error_buf, error_buf_size, "internal error: unhandled primitive valtype tag 0x%02X after case match", tag);
                 goto fail;
             }
             break;
 
-        case 0x00: /* definedtypeidx (u32) - reference to a type definition */
+        case 0x00: /* definedtypeidx (u32) - reference to a type definition (spec: typeidx) */
             valtype->kind = VAL_TYPE_KIND_TYPE_IDX;
             read_leb_uint32(p, buf_end, valtype->u.type_idx);
             break;
 
-        case 0x6E: /* record - (vec <record-field>) ; record-field := (label string) (type valtype) */
+        /* Component Model 1.0 Spec `deftype` tags for valtype variants */
+        case 0x72: /* record - (vec <record-field>) ; record-field := (label string) (type valtype) */
             valtype->kind = VAL_TYPE_KIND_RECORD;
             read_leb_uint32(p, buf_end, count);
             valtype->u.record.field_count = count;
@@ -993,7 +994,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             }
             break;
 
-        case 0x6D: /* variant - (vec <variant-case>) ; variant-case := (label string) (type (optional valtype)) (refines (optional u32)) */
+        case 0x71: /* variant - (vec <variant-case>) ; variant-case := (label string) (type (optional valtype)) (refines (optional u32)) */
             valtype->kind = VAL_TYPE_KIND_VARIANT;
             read_leb_uint32(p, buf_end, count);
             valtype->u.variant.case_count = count;
@@ -1008,21 +1009,21 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
                     uint8 valtype_present;
                     CHECK_BUF(p, buf_end, 1);
                     valtype_present = *p++;
-                    if (valtype_present == 0x01) {
+                    if (valtype_present == 0x01) { /* 0x01 means valtype is present */
                         current_case->valtype = loader_malloc(sizeof(WASMComponentValType), error_buf, error_buf_size);
                         if (!current_case->valtype) goto fail;
                         memset(current_case->valtype, 0, sizeof(WASMComponentValType)); // For safe free
                         if (!parse_valtype(&p, buf_end, current_case->valtype, error_buf, error_buf_size)) goto fail;
-                    } else {
+                    } else { /* 0x00 means valtype is not present */
                         current_case->valtype = NULL;
                     }
                     
                     uint8 refines_present; 
                     CHECK_BUF(p, buf_end, 1);
                     refines_present = *p++;
-                    if (refines_present == 0x01) {
+                    if (refines_present == 0x01) { /* 0x01 means refines index is present */
                         read_leb_uint32(p, buf_end, current_case->default_case_idx); 
-                    } else {
+                    } else { /* 0x00 means refines is not present */
                         current_case->default_case_idx = (uint32)-1; 
                     }
                 }
@@ -1031,7 +1032,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             }
             break;
 
-        case 0x6C: /* list - <valtype> */
+        case 0x70: /* list - <valtype> */
             valtype->kind = VAL_TYPE_KIND_LIST;
             valtype->u.list.element_valtype = loader_malloc(sizeof(WASMComponentValType), error_buf, error_buf_size);
             if (!valtype->u.list.element_valtype) goto fail;
@@ -1039,7 +1040,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             if (!parse_valtype(&p, buf_end, valtype->u.list.element_valtype, error_buf, error_buf_size)) goto fail;
             break;
 
-        case 0x6B: /* tuple - (vec <valtype>) */
+        case 0x6f: /* tuple - (vec <valtype>) */
             valtype->kind = VAL_TYPE_KIND_TUPLE;
             read_leb_uint32(p, buf_end, count);
             valtype->u.tuple.element_count = count;
@@ -1055,7 +1056,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             }
             break;
 
-        case 0x6A: /* flags - (vec <string>) */
+        case 0x6e: /* flags - (vec <string>) */
             valtype->kind = VAL_TYPE_KIND_FLAGS;
             read_leb_uint32(p, buf_end, count);
             valtype->u.flags.label_count = count;
@@ -1071,7 +1072,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             }
             break;
 
-        case 0x69: /* enum - (vec <string>) */
+        case 0x6d: /* enum - (vec <string>) */
             valtype->kind = VAL_TYPE_KIND_ENUM;
             read_leb_uint32(p, buf_end, count);
             valtype->u.enum_type.label_count = count;
@@ -1087,7 +1088,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             }
             break;
 
-        case 0x68: /* option - <valtype> */
+        case 0x6b: /* option - <valtype> */
             valtype->kind = VAL_TYPE_KIND_OPTION;
             valtype->u.option.valtype = loader_malloc(sizeof(WASMComponentValType), error_buf, error_buf_size);
             if (!valtype->u.option.valtype) goto fail;
@@ -1095,7 +1096,7 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             if (!parse_valtype(&p, buf_end, valtype->u.option.valtype, error_buf, error_buf_size)) goto fail;
             break;
 
-        case 0x67: /* result - (ok (optional <valtype>)) (err (optional <valtype>)) */
+        case 0x6a: /* result - (ok (optional <valtype>)) (err (optional <valtype>)) */
             valtype->kind = VAL_TYPE_KIND_RESULT;
             valtype->u.result.ok_valtype = NULL; 
             valtype->u.result.err_valtype = NULL;
@@ -1103,34 +1104,34 @@ parse_valtype(const uint8 **p_buf, const uint8 *buf_end,
             uint8 ok_present;
             CHECK_BUF(p, buf_end, 1);
             ok_present = *p++;
-            if (ok_present == 0x01) {
+            if (ok_present == 0x01) { /* 0x01 means valtype is present */
                 valtype->u.result.ok_valtype = loader_malloc(sizeof(WASMComponentValType), error_buf, error_buf_size);
                 if (!valtype->u.result.ok_valtype) goto fail;
                 memset(valtype->u.result.ok_valtype, 0, sizeof(WASMComponentValType)); // For safe free
                 if (!parse_valtype(&p, buf_end, valtype->u.result.ok_valtype, error_buf, error_buf_size)) goto fail;
-            }
+            } /* 0x00 means valtype is not present, already NULL */
             
             uint8 err_present;
             CHECK_BUF(p, buf_end, 1);
             err_present = *p++;
-            if (err_present == 0x01) {
+            if (err_present == 0x01) { /* 0x01 means valtype is present */
                 valtype->u.result.err_valtype = loader_malloc(sizeof(WASMComponentValType), error_buf, error_buf_size);
                 if (!valtype->u.result.err_valtype) goto fail;
                 memset(valtype->u.result.err_valtype, 0, sizeof(WASMComponentValType)); // For safe free
                 if (!parse_valtype(&p, buf_end, valtype->u.result.err_valtype, error_buf, error_buf_size)) goto fail;
-            }
+            } /* 0x00 means valtype is not present, already NULL */
             break;
         
-        case 0x66: /* own - <typeidx to resource> */
+        case 0x69: /* own - <typeidx to resource> */
             valtype->kind = VAL_TYPE_KIND_OWN_TYPE_IDX;
             read_leb_uint32(p, buf_end, valtype->u.type_idx);
             break;
         
-        case 0x65: /* borrow - <typeidx to resource> */
+        case 0x68: /* borrow - <typeidx to resource> */
             valtype->kind = VAL_TYPE_KIND_BORROW_TYPE_IDX;
             read_leb_uint32(p, buf_end, valtype->u.type_idx);
             break;
-
+        /* Note: Spec 0x67 for fixed-size list is not handled here yet */
         default:
             set_error_buf_v(error_buf, error_buf_size, "unknown valtype tag 0x%02X", tag);
             goto fail;
@@ -1292,23 +1293,30 @@ parse_func_type(const uint8 **p_buf, const uint8 *buf_end,
         func_type->params = NULL;
     }
 
-    // Result: (0x00 -> void | 0x01 <valtype>)
+    // Result encoding: resultlist ::= 0x00 t:<valtype> | 0x01 0x00 (void)
     uint8 result_tag;
     CHECK_BUF(p, buf_end, 1);
     result_tag = *p++;
-    if (result_tag == 0x01) { // One valtype for result
+    if (result_tag == 0x00) { // valtype is present
         func_type->result = loader_malloc(sizeof(WASMComponentValType), error_buf, error_buf_size);
         if (!func_type->result) goto fail;
         memset(func_type->result, 0, sizeof(WASMComponentValType));
         if (!parse_valtype(&p, buf_end, func_type->result, error_buf, error_buf_size)) goto fail;
-    } else if (result_tag == 0x00) { // Void result
-        func_type->result = NULL;
+    } else if (result_tag == 0x01) { // Potentially void result
+        CHECK_BUF(p, buf_end, 1); // Check for the expected 0x00 for void
+        uint8 void_marker = *p++;
+        if (void_marker == 0x00) {
+            func_type->result = NULL; // Void result
+        } else {
+            set_error_buf_v(error_buf, error_buf_size, "invalid void marker for func type result: expected 0x01 0x00, got 0x01 0x%02X", void_marker);
+            goto fail;
+        }
     } else {
-        set_error_buf_v(error_buf, error_buf_size, "invalid result tag for func type: 0x%02X", result_tag);
+        set_error_buf_v(error_buf, error_buf_size, "invalid result_tag for func type: 0x%02X", result_tag);
         goto fail;
     }
     
-    LOG_VERBOSE("Parsed func_type: params %u, result %s", func_type->param_count, func_type->result ? "present" : "void");
+    LOG_VERBOSE("Parsed func_type: params %u, result %s", func_type->param_count, func_type->result ? "present" : "void/none");
     *p_buf = p;
     return true;
 fail:
@@ -1676,13 +1684,13 @@ parse_resource_type(const uint8 **p_buf, const uint8 *buf_end,
     // This is tricky. For now, if it's a primitive, we'll store its enum value.
     // A more robust way would be for parse_valtype to return the original tag if needed,
     // or the struct should store WASMComponentValType* rep.
-    if (rep_valtype.kind == VAL_TYPE_KIND_PRIMITIVE) {
-        // This assumes res_type->rep is meant to hold the WASMComponentPrimValType enum.
-        // This is a mismatch with the comment "0x7F (i32)".
-        // Let's assume the struct wants the enum.
+    // Spec indicates the 'rep' valtype for a resource must be s32 or u32.
+    if (rep_valtype.kind == VAL_TYPE_KIND_PRIMITIVE
+        && (rep_valtype.u.primitive == PRIM_VAL_S32 || rep_valtype.u.primitive == PRIM_VAL_U32)) {
+        // Store the WASMComponentPrimValType enum value (e.g., PRIM_VAL_S32 which is 0x7a)
         res_type->rep = (uint32)rep_valtype.u.primitive;
     } else {
-        set_error_buf(error_buf, error_buf_size, "resource representation must be a primitive type (current loader limitation)");
+        set_error_buf(error_buf, error_buf_size, "resource representation must be s32 or u32 primitive type");
         free_valtype_contents(&rep_valtype);
         goto fail;
     }
@@ -1757,8 +1765,9 @@ parse_defined_type_entry(const uint8 **p_buf, const uint8 *buf_end,
                 goto fail;
             }
             break;
-        case 0x43: /* resourcetype */
-            p++; /* Consume 0x43 */
+        case 0x3f: /* resourcetype (Spec tag for resource type definition with abstract rep) */
+                   /* Note: Spec also has 0x3e for async dtor, not yet handled here. */
+            p++; /* Consume 0x3f */
             defined_type->kind = DEF_TYPE_KIND_RESOURCE;
             if (!parse_resource_type(&p, buf_end, &defined_type->u.res_type, error_buf, error_buf_size)) {
                 goto fail;
@@ -1842,27 +1851,16 @@ load_canonical_section(const uint8 **p_buf, const uint8 *buf_end,
         LOG_VERBOSE("Parsing canonical function %u, kind 0x%02X", i, current_canon->func_kind);
 
         switch (current_canon->func_kind) {
-            case CANONICAL_FUNC_KIND_LIFT: // 0x00
-                CHECK_BUF(p, buf_end, 1); // core sort byte (must be 0x00 for func)
-                sort_byte = *p++;
-                if (sort_byte != 0x00) {
-                    set_error_buf_v(error_buf, error_buf_size, "unexpected sort byte 0x%02X for LIFT kind", sort_byte);
-                    goto fail;
-                }
+            case CANONICAL_FUNC_KIND_LIFT: // Spec opcode 0x00: lift (core_func_idx, options, component_func_type_idx)
                 read_leb_uint32(p, buf_end, current_canon->u.lift.core_func_idx);
-                // Options are parsed after specific fields for LIFT
+                // Options will be parsed after this switch.
+                // component_func_type_idx will be parsed after options.
                 break;
-            case CANONICAL_FUNC_KIND_LOWER: // 0x01
-                CHECK_BUF(p, buf_end, 1); // core sort byte (must be 0x00 for func)
-                sort_byte = *p++;
-                if (sort_byte != 0x00) {
-                    set_error_buf_v(error_buf, error_buf_size, "unexpected sort byte 0x%02X for LOWER kind", sort_byte);
-                    goto fail;
-                }
+            case CANONICAL_FUNC_KIND_LOWER: // Spec opcode 0x01: lower (component_func_idx, options)
                 read_leb_uint32(p, buf_end, current_canon->u.lower.component_func_idx);
-                // Options are parsed after specific fields for LOWER
+                // Options will be parsed after this switch.
                 break;
-            case CANONICAL_FUNC_KIND_RESOURCE_NEW:      // 0x02
+            case CANONICAL_FUNC_KIND_RESOURCE_NEW:      // Spec opcode 0x02
             case CANONICAL_FUNC_KIND_RESOURCE_DROP:     // 0x03
             case CANONICAL_FUNC_KIND_RESOURCE_REP:      // 0x04
             case CANONICAL_FUNC_KIND_RESOURCE_DROP_ASYNC: // 0x07
@@ -1947,19 +1945,21 @@ load_canonical_section(const uint8 **p_buf, const uint8 *buf_end,
                 opt->value = 0; // Initialize value, might not be set for all kinds
 
                 switch (opt->kind) {
-                    case CANONICAL_OPTION_STRING_ENCODING_UTF8:
-                    case CANONICAL_OPTION_STRING_ENCODING_UTF16:
-                    case CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16: // New
-                    case CANONICAL_OPTION_STRING_ENCODING_COMPACT_UTF16:
-                    case CANONICAL_OPTION_ASYNC: // New
-                    case CANONICAL_OPTION_ALWAYS_TASK_RETURN: // New
+                    /* String encodings (no value) */
+                    case CANONICAL_OPTION_STRING_ENCODING_UTF8:         // Spec 0x00
+                    case CANONICAL_OPTION_STRING_ENCODING_UTF16:        // Spec 0x01
+                    case CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16: // Spec 0x02
+                    /* Other no-value options */
+                    case CANONICAL_OPTION_ASYNC:                        // Spec 0x06
+                    case CANONICAL_OPTION_ALWAYS_TASK_RETURN:           // Spec 0x08
                         /* No value to read for these */
                         LOG_VERBOSE("Parsed option kind 0x%02X (no value)", opt->kind);
                         break;
-                    case CANONICAL_OPTION_MEMORY_IDX:
-                    case CANONICAL_OPTION_REALLOC_FUNC_IDX:
-                    case CANONICAL_OPTION_POST_RETURN_FUNC_IDX:
-                    case CANONICAL_OPTION_CALLBACK_FUNC_IDX: // New
+                    /* Options with u32 value */
+                    case CANONICAL_OPTION_MEMORY_IDX:                   // Spec 0x03
+                    case CANONICAL_OPTION_REALLOC_FUNC_IDX:             // Spec 0x04
+                    case CANONICAL_OPTION_POST_RETURN_FUNC_IDX:         // Spec 0x05
+                    case CANONICAL_OPTION_CALLBACK_FUNC_IDX:            // Spec 0x07
                         read_leb_uint32(p, buf_end, opt->value);
                         LOG_VERBOSE("Parsed option kind 0x%02X with value %u", opt->kind, opt->value);
                         break;
@@ -2265,44 +2265,58 @@ wasm_component_load(const uint8 *buf, uint32 size,
         const uint8 *section_start = p;
 
         switch (section_id) {
-            case COMPONENT_SECTION_ID_CORE_MODULE: /* ID 0 */
+            /* Standard section 0 is Custom Section, not explicitly handled here for components yet */
+            /* Component Model Spec defined Section IDs start from 1 */
+            case COMPONENT_SECTION_ID_CORE_MODULE: /* ID 1 (Spec) */
                 if (!load_core_module_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_CORE_INSTANCE: /* ID 1 */
-                if (!load_core_instance_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_CORE_INSTANCE: /* ID 2 (Spec) */
+                if (!load_core_instance_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_CORE_TYPE: /* ID 2 */
-                 if (!load_core_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_CORE_TYPE: /* ID 3 (Spec) */
+                 if (!load_core_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_COMPONENT: /* ID 3 */
-                if (!load_component_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_COMPONENT: /* ID 4 (Spec) */
+                if (!load_component_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_INSTANCE: /* ID 4 */
-                if (!load_instance_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_INSTANCE: /* ID 5 (Spec) */
+                if (!load_instance_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_ALIAS: /* ID 5 */
-                if (!load_alias_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_ALIAS: /* ID 6 (Spec) */
+                if (!load_alias_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_TYPE: /* ID 6 (Outer Type Section) */
-                if (!load_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_TYPE: /* ID 7 (Spec) - Unified Type Section */
+                /* This now handles all component-level type definitions */
+                if (!load_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_DEFINED_TYPE: /* ID 7 (Component Defined Type Section - deftype) */
-                if (!load_component_defined_type_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
-                break;
-            case COMPONENT_SECTION_ID_CANONICAL: /* ID 8 - Calls function from wasm_component_canonical.c */
+            /* COMPONENT_SECTION_ID_DEFINED_TYPE (old WAMR 7) is removed */
+            case COMPONENT_SECTION_ID_CANONICAL: /* ID 8 (Spec) */
                 if (!load_canonical_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_START: /* ID 9 */
-                if (!load_start_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_START: /* ID 9 (Spec) */
+                if (!load_start_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_IMPORT: /* ID 10 */
-                if (!load_import_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_IMPORT: /* ID 10 (Spec) */
+                if (!load_import_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
                 break;
-            case COMPONENT_SECTION_ID_EXPORT: /* ID 11 */
-                if (!load_export_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail; 
+            case COMPONENT_SECTION_ID_EXPORT: /* ID 11 (Spec) */
+                if (!load_export_section(&p, p + section_size, component, error_buf, error_buf_size)) goto fail;
+                break;
+            case COMPONENT_SECTION_ID_VALUE: /* ID 12 (Spec) */
+                LOG_VERBOSE("Found Value Section (ID 12) - size %u. Parsing not yet implemented, skipping.", section_size);
+                p += section_size; /* Skip content for now */
                 break;
             default:
-                os_printf("Skipping unknown component section ID: %u, size: %u\n", section_id, section_size);
+                /* Per spec, custom sections have ID 0. Other unknown sections are errors. */
+                if (section_id == 0) { /* Custom Section ID */
+                     os_printf("Skipping custom component section ID: %u, size: %u\n", section_id, section_size);
+                } else {
+                    os_printf("Skipping unknown component section ID: %u, size: %u\n", section_id, section_size);
+                    /* According to spec, unknown non-custom sections should be an error.
+                       However, for forward compatibility or during development, skipping might be preferred.
+                       For now, we will just skip. Revisit if strict error is needed.
+                    */
+                }
                 p += section_size; /* Advance pointer for unknown sections */
                 break;
         }
@@ -2445,12 +2459,7 @@ wasm_component_unload(WASMComponent *component)
         }
         wasm_runtime_free(component->type_definitions);
     }
-    if (component->component_type_definitions) {
-         for (uint32 i = 0; i < component->component_type_definition_count; ++i) {
-            free_defined_type_contents(&component->component_type_definitions[i]);
-        }
-        wasm_runtime_free(component->component_type_definitions);
-    }
+    /* component->component_type_definitions was removed, its contents are now part of component->type_definitions */
 
 
     if (component->canonicals) {
