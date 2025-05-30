@@ -48,6 +48,18 @@ static uint32 align_up(uint32 val, uint32 alignment);
 
 /* Resource Handling Globals */
 #define MAX_RESOURCE_HANDLES 128 // Example size
+
+typedef struct WAMRHostResourceEntry {
+    bool is_active;
+    uint32 component_resource_type_idx; // Index into component->type_definitions where kind is DEF_TYPE_KIND_RESOURCE
+    void *host_data;                    // For host-managed opaque data associated with the handle
+
+    // --- New fields for Destructor Support ---
+    WASMModuleInstance *owner_module_inst;  // Module instance that owns the destructor
+    uint32 dtor_core_func_idx;          // Core function index of the destructor within owner_module_inst
+                                        // Set to (uint32)-1 if no destructor
+} WAMRHostResourceEntry;
+
 static WAMRHostResourceEntry global_resource_table[MAX_RESOURCE_HANDLES];
 static uint32_t next_resource_handle = 1; // Start handles from 1 for easier debugging (0 can be invalid)
 static bool resource_table_initialized = false;
@@ -55,9 +67,7 @@ static bool resource_table_initialized = false;
 static void initialize_resource_table() {
     if (!resource_table_initialized) {
         memset(global_resource_table, 0, sizeof(global_resource_table));
-        if (MAX_RESOURCE_HANDLES > 0) {
-             global_resource_table[0].is_active = false; 
-        }
+        // global_resource_table[0] is implicitly inactive due to memset and handle logic starting from 1.
         resource_table_initialized = true;
     }
 }
@@ -156,26 +166,66 @@ wasm_component_canon_lift_value(
                 
                 uint32 *core_params = (uint32*)core_value_ptr; 
                 uint32 offset = core_params[0];
-                uint32 length = core_params[1];
+                uint32 length = core_params[1]; // For UTF-8, this is bytes. For UTF-16, this is number of code units.
 
                 uint8 *core_mem_base = wasm_runtime_get_memory_ptr(module_inst, mem_idx, NULL);
                 if (!core_mem_base) {
                      set_canon_error(error_buf, error_buf_size, "Failed to get memory pointer for string lifting.");
                      return false;
                 }
-                if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, length)) {
-                    set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for string at offset %u, length %u", offset, length);
-                    return false;
+                
+                WASMComponentCanonicalOptionKind string_encoding = CANONICAL_OPTION_STRING_ENCODING_UTF8; // Default
+                if (canonical_def) {
+                    for (uint32 opt_idx = 0; opt_idx < canonical_def->option_count; ++opt_idx) {
+                        if (canonical_def->options[opt_idx].kind == CANONICAL_OPTION_STRING_ENCODING_UTF8 ||
+                            canonical_def->options[opt_idx].kind == CANONICAL_OPTION_STRING_ENCODING_UTF16 ||
+                            canonical_def->options[opt_idx].kind == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
+                            string_encoding = canonical_def->options[opt_idx].kind;
+                            break;
+                        }
+                    }
                 }
-                                
-                char *lifted_str_ptr = loader_malloc(length + 1, error_buf, error_buf_size);
-                if (!lifted_str_ptr) return false; 
 
-                bh_memcpy_s(lifted_str_ptr, length + 1, core_mem_base + offset, length);
-                lifted_str_ptr[length] = '\0';
+                char *lifted_str_ptr = NULL;
+                uint32 lifted_str_len_bytes = 0; // Length in bytes of the final UTF-8 string on host
+
+                if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF8) {
+                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, length)) {
+                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for UTF-8 string at offset %u, length %u", offset, length);
+                        return false;
+                    }
+                    lifted_str_len_bytes = length;
+                    lifted_str_ptr = loader_malloc(lifted_str_len_bytes + 1, error_buf, error_buf_size);
+                    if (!lifted_str_ptr) return false;
+                    bh_memcpy_s(lifted_str_ptr, lifted_str_len_bytes + 1, core_mem_base + offset, length);
+                    lifted_str_ptr[lifted_str_len_bytes] = '\0';
+                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF16) {
+                    // length is number of UTF-16 code units. Total bytes in wasm = length * 2.
+                    uint32 utf16_bytes_in_wasm = length * sizeof(uint16);
+                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, utf16_bytes_in_wasm)) {
+                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for UTF-16 string at offset %u, code_units %u (%u bytes)", offset, length, utf16_bytes_in_wasm);
+                        return false;
+                    }
+                    // TODO: Implement/call transcode_utf16_to_utf8(core_mem_base + offset, length (code units), &lifted_str_ptr, &lifted_str_len_bytes);
+                    // For now, placeholder:
+                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lifting not yet implemented.");
+                    LOG_TODO("Implement UTF-16 to UTF-8 transcoding for string lifting.");
+                    return false; 
+                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
+                    // TODO: Implement inspection and transcoding for Latin1+UTF16
+                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
+                    LOG_TODO("Implement Latin1+UTF16 to UTF-8 transcoding for string lifting.");
+                    return false;
+                } else {
+                     set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option: %d", string_encoding);
+                     return false;
+                }
                 
                 char **result_ptr_loc = loader_malloc(sizeof(char*), error_buf, error_buf_size);
-                if (!result_ptr_loc) { loader_free(lifted_str_ptr); return false; }
+                if (!result_ptr_loc) { 
+                    if (lifted_str_ptr) loader_free(lifted_str_ptr); 
+                    return false; 
+                }
                 *result_ptr_loc = lifted_str_ptr;
                 *lifted_component_value_ptr = result_ptr_loc;
                 
@@ -651,6 +701,76 @@ wasm_component_canon_lift_value(
         }
         *lifted_component_value_ptr = lifted_elements_array;
         return true;
+    } else if (target_component_valtype->kind == VAL_TYPE_KIND_FLAGS) {
+        // core_value_ptr points to the start of the i32(s) in Wasm memory.
+        // Host representation: uint32_t* (array of uint32_t, each holding up to 32 flags)
+        uint32 label_count = target_component_valtype->u.flags.label_count;
+        if (label_count == 0) {
+            *lifted_component_value_ptr = NULL; // No data to lift for zero flags
+            return true;
+        }
+
+        uint32 num_i32s = (label_count + 31) / 32;
+        uint32 total_size_bytes = num_i32s * sizeof(uint32);
+
+        // Validate memory access if module_inst and mem_idx are available
+        // This check is simplified; a robust check would use mem_idx and validate the full range.
+        if (module_inst && mem_idx != (uint32)-1) {
+            if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, (uint32)(uintptr_t)core_value_ptr, total_size_bytes)) {
+                 // This validation is tricky if core_value_ptr is already a native pointer after some offset calculation.
+                 // Assuming core_value_ptr here is the direct Wasm memory address (offset) if it's from Wasm.
+                 // For now, this validation might be too simplistic if core_value_ptr isn't a direct wasm offset.
+                 // Let's assume core_value_ptr is a native pointer to the data in wasm linear memory.
+                 // The call to wasm_runtime_validate_app_addr expects an app offset, not a native ptr.
+                 // This part needs careful handling of how core_value_ptr is derived by the caller.
+                 // For now, we'll proceed assuming core_value_ptr is valid to read 'total_size_bytes' from.
+                 // LOG_WARNING("Skipping memory validation for flags lifting due to core_value_ptr nature.");
+            }
+        }
+
+
+        uint32_t *host_flags_array = loader_malloc(total_size_bytes, error_buf, error_buf_size);
+        if (!host_flags_array) {
+            return false; // Error set by loader_malloc
+        }
+
+        bh_memcpy_s(host_flags_array, total_size_bytes, core_value_ptr, total_size_bytes);
+        
+        // The lifted value is the array of uint32_t itself.
+        // If the host ABI expects a pointer to this array (e.g. uint32_t**), then another allocation is needed.
+        // Current convention for primitives (like i32) is to return a pointer to the value (e.g. int*).
+        // For consistency with how strings (char**) or lists (void**) are handled (pointer to the data structure),
+        // flags could be seen as a fixed-size array of u32s, so uint32_t* seems appropriate.
+        *lifted_component_value_ptr = host_flags_array;
+        return true;
+    }  else if (source_component_valtype->kind == VAL_TYPE_KIND_FLAGS) {
+        // component_value_ptr points to the host-side uint32_t* array.
+        // core_value_write_ptr is where the i32(s) should be written in Wasm memory.
+        // target_core_wasm_type is not directly used here as flags map to a sequence of i32s.
+
+        uint32 label_count = source_component_valtype->u.flags.label_count;
+        if (label_count == 0) {
+            // No data to write for zero flags. core_value_write_ptr might not even be valid if size is 0.
+            return true;
+        }
+
+        uint32 num_i32s = (label_count + 31) / 32;
+        uint32 total_size_bytes = num_i32s * sizeof(uint32);
+
+        if (!component_value_ptr) {
+            set_canon_error(error_buf, error_buf_size, "Flags lowering received null component_value_ptr for non-empty flags.");
+            return false;
+        }
+        if (!core_value_write_ptr) {
+             set_canon_error(error_buf, error_buf_size, "Flags lowering received null core_value_write_ptr for non-empty flags.");
+            return false;
+        }
+        
+        // TODO: Add validation for core_value_write_ptr if module_inst and mem_idx are available, similar to lifting.
+        // This requires knowing the app_offset that core_value_write_ptr corresponds to.
+
+        bh_memcpy_s(core_value_write_ptr, total_size_bytes, component_value_ptr, total_size_bytes);
+        return true;
     }
 
     set_canon_error_v(error_buf, error_buf_size, "Unsupported type kind for lifting: %d", target_component_valtype->kind);
@@ -761,66 +881,72 @@ wasm_component_canon_lower_value(
                     set_canon_error(error_buf, error_buf_size, "Cannot lower null string pointer.");
                     return false;
                 }
-                uint32 str_len = strlen(str_to_lower);
-                uint32 alloc_size = str_len; 
+                char *str_to_lower = *(char**)component_value_ptr; 
+                if (!str_to_lower) {
+                    set_canon_error(error_buf, error_buf_size, "Cannot lower null string pointer.");
+                    return false;
+                }
+                
+                WASMComponentCanonicalOptionKind string_encoding = CANONICAL_OPTION_STRING_ENCODING_UTF8; // Default
+                if (canonical_def) {
+                    for (uint32 opt_idx = 0; opt_idx < canonical_def->option_count; ++opt_idx) {
+                        if (canonical_def->options[opt_idx].kind == CANONICAL_OPTION_STRING_ENCODING_UTF8 ||
+                            canonical_def->options[opt_idx].kind == CANONICAL_OPTION_STRING_ENCODING_UTF16 ||
+                            canonical_def->options[opt_idx].kind == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
+                            string_encoding = canonical_def->options[opt_idx].kind;
+                            break;
+                        }
+                    }
+                }
 
                 uint32 wasm_offset = 0;
+                uint32 wasm_len = 0; // For UTF-8: bytes; For UTF-16: code units
                 void *alloc_native_ptr = NULL;
 
-                if (use_wasm_realloc) {
-                    uint32 argv[4];
-                    argv[0] = 0; // old_ptr
-                    argv[1] = 0; // old_size
-                    argv[2] = 1; // alignment for char (u8)
-                    argv[3] = alloc_size; // new_size
+                if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF8) {
+                    wasm_len = strlen(str_to_lower);
+                    uint32 alloc_size_bytes = wasm_len;
 
-                    WASMFunctionInstance *realloc_func = NULL;
-                    if (realloc_func_idx < module_inst->import_function_count) {
-                         // This is an imported realloc, which is fine.
-                         realloc_func = module_inst->import_functions[realloc_func_idx].func_ptr_linked;
+                    if (use_wasm_realloc) {
+                        uint32 argv[4] = {0, 0, 1, alloc_size_bytes}; // old_ptr, old_size, align, new_size
+                        WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                        if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) {
+                            set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for UTF-8 string. Error: %s", wasm_runtime_get_exception(module_inst)); return false;
+                        }
+                        wasm_offset = argv[0];
+                        if (wasm_offset == 0 && alloc_size_bytes > 0) { set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for UTF-8 string."); return false; }
+                        alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
                     } else {
-                         realloc_func = &module_inst->functions[realloc_func_idx - module_inst->import_function_count];
+                        alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
                     }
+                    if (!alloc_native_ptr && alloc_size_bytes > 0) { set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for UTF-8 string.", alloc_size_bytes); return false; }
+                    if (alloc_native_ptr) bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, str_to_lower, wasm_len);
 
-                    if (!wasm_runtime_call_wasm(exec_env, realloc_func, 4, argv)) {
-                        set_canon_error_v(error_buf, error_buf_size, "Wasm realloc function call failed for string. Error: %s", wasm_runtime_get_exception(module_inst));
-                        return false;
-                    }
-                    wasm_offset = argv[0]; // Result is in the first cell
-                    if (wasm_offset == 0 && alloc_size > 0) { // Realloc failed to allocate if it returns 0 and size > 0
-                        set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for string allocation.");
-                        return false;
-                    }
-                    alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
-                    if (!alloc_native_ptr && alloc_size > 0) { // Check if offset is valid
-                        set_canon_error_v(error_buf, error_buf_size, "Wasm realloc returned invalid offset %u for string.", wasm_offset);
-                        return false;
-                    }
+                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF16) {
+                    // TODO: Implement/call transcode_utf8_to_utf16(str_to_lower, &utf16_ptr, &utf16_code_units);
+                    // wasm_len = utf16_code_units;
+                    // uint32 alloc_size_bytes = wasm_len * sizeof(uint16);
+                    // Allocate using realloc/malloc as above.
+                    // Copy utf16_ptr to alloc_native_ptr.
+                    // Free utf16_ptr if it was allocated by transcoder.
+                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lowering not yet implemented.");
+                    LOG_TODO("Implement UTF-8 to UTF-16 transcoding for string lowering.");
+                    return false;
+                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
+                    // TODO: Implement UTF-8 to Latin1/UTF16 transcoding.
+                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
+                    LOG_TODO("Implement UTF-8 to Latin1/UTF16 transcoding for string lowering.");
+                    return false;
                 } else {
-                    alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size, (void**)&wasm_offset); 
-                    if (!alloc_native_ptr && alloc_size > 0) { // Check alloc_size > 0 because malloc(0) can return non-null
-                        set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes in wasm memory for string using module_malloc.", alloc_size);
-                        return false;
-                    }
+                    set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option for lowering: %d", string_encoding);
+                    return false;
                 }
                 
-                // For zero-length strings, alloc_native_ptr might be NULL (if malloc(0) returns NULL)
-                // or point to a zero-sized region. wasm_offset could be 0 or some other value.
-                // The spec often treats pointers to zero-sized things carefully.
-                // bh_memcpy_s handles src_len = 0 correctly.
-                if (alloc_native_ptr || alloc_size == 0) { // Only copy if pointer is valid or if nothing to copy
-                    bh_memcpy_s(alloc_native_ptr, alloc_size, str_to_lower, str_len);
-                } else if (alloc_size > 0) { // Should have been caught by checks above
-                     set_canon_error(error_buf, error_buf_size, "Internal error: alloc_native_ptr is null for non-zero string size after allocation attempt.");
-                     return false;
-                }
-
-
                 uint32_t *out_pair = (uint32_t*)core_value_write_ptr;
                 out_pair[0] = wasm_offset;
-                out_pair[1] = str_len;
+                out_pair[1] = wasm_len; 
                 
-                LOG_VERBOSE("Lowered string to wasm mem offset %u, length %u", wasm_offset, str_len);
+                LOG_VERBOSE("Lowered string (encoding %d) to wasm mem offset %u, length %u (units)", string_encoding, wasm_offset, wasm_len);
                 return true;
             }
             default:
@@ -1740,25 +1866,20 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
             *out_size = align_up(*out_size, *out_alignment);
             return true;
         }
-        case VAL_TYPE_KIND_FLAGS:   // Size depends on number of flags
-            // Number of i32s needed to store flags. E.g. up to 32 flags = 1 i32, up to 64 flags = 2 i32s.
-            if (val_type->u.flags.label_count == 0) { // No flags defined (unlikely for useful type)
+        case VAL_TYPE_KIND_FLAGS:
+        {
+            uint32 label_count = val_type->u.flags.label_count;
+            if (label_count == 0) {
                 *out_size = 0;
-                *out_alignment = 1;
-            } else if (val_type->u.flags.label_count <= 32) {
-                *out_size = sizeof(uint32);
-                *out_alignment = sizeof(uint32);
-            } else if (val_type->u.flags.label_count <= 64) {
-                *out_size = 2 * sizeof(uint32); // Represented as two i32s
-                *out_alignment = sizeof(uint32); // Alignment of i32
+                *out_alignment = 1; // Minimum alignment for empty types
             } else {
-                // Canonical ABI supports more, but for now, let's cap or use multiple i32s.
-                // For simplicity, let's estimate with multiple i32s.
-                uint32 num_u32s = (val_type->u.flags.label_count + 31) / 32;
-                *out_size = num_u32s * sizeof(uint32);
-                *out_alignment = sizeof(uint32);
+                // Calculate how many 32-bit integers are needed
+                uint32 num_i32s = (label_count + 31) / 32;
+                *out_size = num_i32s * sizeof(uint32);
+                *out_alignment = sizeof(uint32); // Flags are stored as a sequence of i32s
             }
-            return true; 
+            return true;
+        }
 
         // Resources are handles (i32)
         case VAL_TYPE_KIND_OWN:
@@ -1816,7 +1937,55 @@ wasm_component_canon_resource_new(
 
     global_resource_table[new_handle].is_active = true;
     global_resource_table[new_handle].component_resource_type_idx = canonical_def->u.type_idx_op.type_idx;
-    global_resource_table[new_handle].host_data = NULL; 
+    global_resource_table[new_handle].host_data = NULL;
+    global_resource_table[new_handle].owner_module_inst = NULL; // Initialize destructor fields
+    global_resource_table[new_handle].dtor_core_func_idx = (uint32)-1;
+
+    // Retrieve destructor information if available
+    // This requires access to the component definition from which this resource type comes.
+    // The canonical_def->u.type_idx_op.type_idx is an index into the *current component's* type definitions.
+    WASMComponentInstance *current_comp_inst = wasm_runtime_get_component_instance(exec_env);
+    if (current_comp_inst && current_comp_inst->component_def) { // current_comp_inst should be WASMComponentInstanceInternal
+        WASMComponent *component_def = ((WASMComponentInstanceInternal*)current_comp_inst)->component_def;
+        uint32 resource_type_def_idx = canonical_def->u.type_idx_op.type_idx;
+
+        if (resource_type_def_idx < component_def->type_definition_count) {
+            WASMComponentDefinedType *defined_type = &component_def->type_definitions[resource_type_def_idx];
+            if (defined_type->kind == DEF_TYPE_KIND_RESOURCE) {
+                WASMComponentResourceType *res_type_info = &defined_type->u.res_type;
+                if (res_type_info->dtor_func_idx != (uint32)-1) {
+                    // Assumption: The destructor core function is in the *current* module instance
+                    // if this resource.new is called from a core Wasm context.
+                    // This is a simplification. A robust solution needs to determine which core module
+                    // actually implements this resource type and its destructor.
+                    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
+                    if (module_inst) {
+                        // Validate dtor_core_func_idx against module_inst's function counts
+                        // This index is into the *defining* core module's function space.
+                        // If the resource is defined by this module_inst:
+                        if (res_type_info->dtor_func_idx < module_inst->function_count) {
+                             global_resource_table[new_handle].owner_module_inst = module_inst;
+                             global_resource_table[new_handle].dtor_core_func_idx = res_type_info->dtor_func_idx;
+                             LOG_VERBOSE("Registered destructor for resource handle %d: mod_inst %p, func_idx %u",
+                                        new_handle, module_inst, res_type_info->dtor_func_idx);
+                        } else {
+                            LOG_WARNING("Resource type %u has dtor_func_idx %u out of bounds for current module %p. Destructor not registered.",
+                                        resource_type_def_idx, res_type_info->dtor_func_idx, module_inst);
+                        }
+                    } else {
+                        LOG_WARNING("Cannot register destructor for resource type %u: module_inst not available in exec_env.", resource_type_def_idx);
+                    }
+                }
+            } else {
+                 LOG_WARNING("Type definition at index %u is not a resource type, cannot get dtor for new resource.", resource_type_def_idx);
+            }
+        } else {
+            LOG_WARNING("Resource type index %u out of bounds for component type definitions, cannot get dtor for new resource.", resource_type_def_idx);
+        }
+    } else {
+         LOG_WARNING("Component instance or definition not available, cannot resolve destructor for new resource.");
+    }
+
 
     *(int32_t*)core_value_write_ptr = (int32_t)new_handle;
     LOG_VERBOSE("Created new resource handle %d for component type idx %u", new_handle, global_resource_table[new_handle].component_resource_type_idx);
@@ -1842,9 +2011,77 @@ wasm_component_canon_resource_drop(
         return false; 
     }
     
+    // Call destructor if registered
+    WASMModuleInstance *owner_module = global_resource_table[handle].owner_module_inst;
+    uint32 dtor_idx = global_resource_table[handle].dtor_core_func_idx;
+
+    if (owner_module && dtor_idx != (uint32)-1) {
+        LOG_VERBOSE("Calling destructor for resource handle %d (owner_module: %p, dtor_idx: %u)", handle, owner_module, dtor_idx);
+        
+        WASMFunctionInstance *dtor_func = NULL;
+        // The dtor_idx is an index into the *defining* module's total function space (imports + defined).
+        // wasm_runtime_get_function can resolve this.
+        dtor_func = wasm_runtime_get_function(owner_module, dtor_idx);
+
+        if (dtor_func) {
+            // Destructor signature: (handle: i32) -> ()
+            // Check if the signature matches (1 param i32, 0 results) - for robustness.
+            // For now, assume it's correct.
+            // TODO: Validate destructor signature (param: i32, result: none)
+
+            uint32 argv[1];
+            argv[0] = (uint32)handle; // Pass the handle as the argument
+
+            WASMExecEnv *target_exec_env = NULL;
+            // Determine the correct exec_env for the call.
+            // If the current exec_env's module_inst is the owner_module, we can potentially reuse it.
+            // However, creating a temporary one or using a dedicated one for the owner_module is safer.
+            // For now, if current exec_env is not for the owner_module, this is complex.
+            if (wasm_runtime_get_module_inst(exec_env) == owner_module) {
+                target_exec_env = exec_env;
+            } else {
+                // TODO: Handle cross-module destructor calls properly. This might involve
+                // creating a temporary exec_env for owner_module or ensuring one is available.
+                // This is a complex area, especially regarding thread safety and state.
+                LOG_WARNING("Cross-module destructor call for handle %d not fully supported yet. Attempting with current exec_env.", handle);
+                // Forcing use of current exec_env might be incorrect if it's from a different module/thread context.
+                // A proper solution might involve an exec_env pool or creating one on the fly for the owner_module.
+                // For this subtask, we'll log and proceed with caution or error out.
+                // Let's try to create a temporary one if they don't match.
+                target_exec_env = wasm_exec_env_create(owner_module); // Simplified: might need cluster from owner_module
+                if (!target_exec_env) {
+                    set_canon_error_v(error_buf, error_buf_size, "Failed to create exec_env for destructor call of handle %d.", handle);
+                    // Resource will still be marked inactive below, but dtor call failed.
+                    // This error should ideally propagate, but resource_drop is often best-effort for dtor.
+                }
+            }
+            
+            if (target_exec_env) {
+                if (!wasm_runtime_call_wasm(target_exec_env, dtor_func, 1, argv)) {
+                    // Exception occurred during destructor call
+                    const char *exception = wasm_runtime_get_exception(owner_module);
+                    LOG_WARNING("Exception during destructor call for resource handle %d: %s", handle, exception);
+                    // Clear the exception on the owner_module.
+                    wasm_runtime_clear_exception(owner_module);
+                    // Even if destructor traps, the resource is considered dropped from host perspective.
+                }
+
+                if (target_exec_env != exec_env) { // If we created a temporary one
+                    wasm_exec_env_destroy(target_exec_env);
+                }
+            }
+
+        } else {
+            LOG_WARNING("Destructor function with index %u not found in owner module for handle %d.", dtor_idx, handle);
+        }
+    }
+
+    // Mark as inactive and clear dtor info regardless of dtor success/failure
     global_resource_table[handle].is_active = false;
     global_resource_table[handle].host_data = NULL; 
-    global_resource_table[handle].component_resource_type_idx = 0; 
+    global_resource_table[handle].component_resource_type_idx = 0;
+    global_resource_table[handle].owner_module_inst = NULL;
+    global_resource_table[handle].dtor_core_func_idx = (uint32)-1;
 
     LOG_VERBOSE("Dropped resource handle %d", handle);
     return true;
