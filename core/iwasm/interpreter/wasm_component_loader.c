@@ -2308,21 +2308,23 @@ wasm_component_load(const uint8 *buf, uint32 size,
             default:
                 /* Per spec, custom sections have ID 0. Other unknown sections are errors. */
                 if (section_id == 0) { /* Custom Section ID */
-                     os_printf("Skipping custom component section ID: %u, size: %u\n", section_id, section_size);
+                     LOG_VERBOSE("Skipping custom component section ID: %u, size: %u", section_id, section_size);
+                     p += section_size; /* Advance pointer for custom sections */
                 } else {
-                    os_printf("Skipping unknown component section ID: %u, size: %u\n", section_id, section_size);
-                    /* According to spec, unknown non-custom sections should be an error.
-                       However, for forward compatibility or during development, skipping might be preferred.
-                       For now, we will just skip. Revisit if strict error is needed.
-                    */
+                    // According to spec, unknown non-custom sections should be an error.
+                    set_error_buf_v(error_buf, error_buf_size, "unknown component section ID: %u", section_id);
+                    goto fail;
                 }
-                p += section_size; /* Advance pointer for unknown sections */
                 break;
         }
-        if (p != section_start + section_size) {
+        // p should be advanced by section_size by each handler.
+        // If p != section_start + section_size here, it means the handler for a known section
+        // did not consume all of its bytes, which is an error.
+        // For skipped custom sections or if we were to allow skipping unknown sections, p would have been advanced.
+        if (section_id != 0 && p != section_start + section_size) {
              set_error_buf_v(error_buf, error_buf_size,
-                            "section size mismatch in section %u, expected %u but got %ld",
-                            section_id, section_size, (long)(p - section_start));
+                            "section content parsing error in section %u: read %ld bytes, expected %u",
+                            section_id, (long)(p - section_start), section_size);
             goto fail;
         }
     }

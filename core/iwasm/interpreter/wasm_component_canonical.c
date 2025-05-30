@@ -45,6 +45,26 @@ static bool get_component_type_core_abi_details(const WASMComponentValType *val_
                                                 char* error_buf, uint32 error_buf_size);
 static uint32 align_up(uint32 val, uint32 alignment);
 
+// Helper to convert primitive value type enum to string for error messages
+static const char* primitive_val_type_to_string(WASMComponentPrimValType ptype) {
+    switch (ptype) {
+        case PRIM_VAL_BOOL: return "bool";
+        case PRIM_VAL_S8: return "s8";
+        case PRIM_VAL_U8: return "u8";
+        case PRIM_VAL_S16: return "s16";
+        case PRIM_VAL_U16: return "u16";
+        case PRIM_VAL_S32: return "s32";
+        case PRIM_VAL_U32: return "u32";
+        case PRIM_VAL_S64: return "s64";
+        case PRIM_VAL_U64: return "u64";
+        case PRIM_VAL_F32: return "f32";
+        case PRIM_VAL_F64: return "f64";
+        case PRIM_VAL_CHAR: return "char";
+        case PRIM_VAL_STRING: return "string";
+        default: return "unknown_primitive";
+    }
+}
+
 
 /* Resource Handling Globals */
 #define MAX_RESOURCE_HANDLES 128 // Example size
@@ -232,7 +252,9 @@ wasm_component_canon_lift_value(
                 return true;
             }
             default:
-                set_canon_error_v(error_buf, error_buf_size, "Unsupported primitive type for lifting: %d", target_component_valtype->u.primitive);
+                set_canon_error_v(error_buf, error_buf_size, "Unsupported primitive type '%s' (tag %d) for lifting", 
+                                  primitive_val_type_to_string(target_component_valtype->u.primitive), 
+                                  target_component_valtype->u.primitive);
                 return false;
         }
     } else if (target_component_valtype->kind == VAL_TYPE_KIND_LIST) {
@@ -950,7 +972,9 @@ wasm_component_canon_lower_value(
                 return true;
             }
             default:
-                set_canon_error_v(error_buf, error_buf_size, "Unsupported primitive type for lowering: %d", source_component_valtype->u.primitive);
+                set_canon_error_v(error_buf, error_buf_size, "Unsupported primitive type '%s' (tag %d) for lowering", 
+                                  primitive_val_type_to_string(source_component_valtype->u.primitive),
+                                  source_component_valtype->u.primitive);
                 return false;
         }
     } else if (source_component_valtype->kind == VAL_TYPE_KIND_LIST) {
@@ -1704,7 +1728,8 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
             uint8 core_type = get_core_wasm_type_for_primitive(val_type->u.primitive);
             *out_size = get_core_wasm_primitive_size(core_type);
             if (*out_size == 0 && val_type->u.primitive != PRIM_VAL_UNDEFINED) { // Undefined might be zero size, but other primitives shouldn't.
-                set_canon_error_v(error_buf, error_buf_size, "Unsupported primitive type or zero size for ABI details: %d", val_type->u.primitive);
+                set_canon_error_v(error_buf, error_buf_size, "Unsupported primitive type '%s' (tag %d) or zero size for ABI details", 
+                                  primitive_val_type_to_string(val_type->u.primitive), val_type->u.primitive);
                 return false;
             }
             *out_alignment = *out_size; 
