@@ -304,10 +304,85 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
 
                 for (j = 0; j < current_instance->u.instantiate.arg_count; j++) {
                     WASMComponentCoreInstanceArg *arg = &current_instance->u.instantiate.args[j];
+                    arg->kind = (uint8)-1; // Initialize to an invalid kind
+
                     if (!parse_string(&p, buf_end, &arg->name, error_buf, error_buf_size)) {
                         goto fail;
                     }
                     read_leb_uint32(p, buf_end, arg->instance_idx);
+
+                    LOG_VERBOSE("Deriving kind for core instance arg '%s' (idx %u for module %u)",
+                                arg->name, j, current_instance->u.instantiate.module_idx);
+
+                    uint32 target_module_idx = current_instance->u.instantiate.module_idx;
+                    if (target_module_idx >= component->core_module_count) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "target module index %u out of bounds for instance arg %s",
+                                        target_module_idx, arg->name);
+                        goto fail;
+                    }
+
+                    WASMModule *module_object = component->core_modules[target_module_idx].module_object;
+                    if (!module_object) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "target module %u not loaded for instance arg %s kind derivation",
+                                        target_module_idx, arg->name);
+                        goto fail;
+                    }
+
+                    bool kind_derived = false;
+                    for (uint32 k = 0; k < module_object->import_count; k++) {
+                        WASMImport *core_import = &module_object->imports[k];
+                        if (core_import->field_name != NULL && strcmp(core_import->field_name, arg->name) == 0) {
+                            arg->kind = core_import->kind;
+                            kind_derived = true;
+                            LOG_VERBOSE("Derived kind for arg '%s' as %u from module import '%s':'%s'",
+                                        arg->name, arg->kind, core_import->module_name, core_import->field_name);
+                            break;
+                        }
+                    }
+
+                    if (!kind_derived) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "import '%s' not found in target module %u for kind derivation",
+                                        arg->name, target_module_idx);
+                        goto fail;
+                    }
+
+                    // New Validation Logic: Check source instance and match export
+                    LOG_VERBOSE("Validating source of instance arg '%s' (instance_idx %u)", arg->name, arg->instance_idx);
+                    if (arg->instance_idx >= component->core_instance_count) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "source core instance index %u out of bounds for argument '%s'",
+                                        arg->instance_idx, arg->name);
+                        goto fail;
+                    }
+
+                    WASMComponentCoreInstance *source_core_instance_def = &component->core_instances[arg->instance_idx];
+                    if (source_core_instance_def->kind != CORE_INSTANCE_KIND_INLINE_EXPORT) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "Source core instance %u for argument '%s' is not an inline export group (kind %u)",
+                                        arg->instance_idx, arg->name, source_core_instance_def->kind);
+                        goto fail;
+                    }
+
+                    bool matched_export_found = false;
+                    for (uint32 export_idx = 0; export_idx < source_core_instance_def->u.inline_export.export_count; export_idx++) {
+                        WASMComponentCoreInlineExport *export_item = &source_core_instance_def->u.inline_export.exports[export_idx];
+                        if (export_item->name != NULL && strcmp(export_item->name, arg->name) == 0 && export_item->kind == arg->kind) {
+                            matched_export_found = true;
+                            LOG_VERBOSE("Successfully matched import '%s' (kind %u) to export from core instance %u",
+                                        arg->name, arg->kind, arg->instance_idx);
+                            break;
+                        }
+                    }
+
+                    if (!matched_export_found) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "Required export '%s' of kind %u not found in source core instance %u",
+                                        arg->name, arg->kind, arg->instance_idx);
+                        goto fail;
+                    }
                 }
             }
         } else if (current_instance->kind == CORE_INSTANCE_KIND_INLINE_EXPORT) {
@@ -375,12 +450,181 @@ load_core_type_section(const uint8 **p_buf, const uint8 *buf_end,
         WASMComponentCoreTypeDef *current_type = &component->core_type_defs[i];
         CHECK_BUF(p, buf_end, 1);
         current_type->kind = *p++;
-        LOG_VERBOSE("Core Type Def %d, kind %02X (actual parsing might be deeper)", i, current_type->kind);
-    }
+        LOG_VERBOSE("Core Type Def %d, kind 0x%02X", i, current_type->kind);
+
+        if (current_type->kind == 0x60) { /* Core Function Type */
+            LOG_VERBOSE("Parsing core function type definition %d.", i);
+            WASMComponentCoreFuncType *func_type = NULL;
+            uint32 param_count, result_count, k;
+
+            func_type = loader_malloc(sizeof(WASMComponentCoreFuncType), error_buf, error_buf_size);
+            if (!func_type) goto fail;
+            memset(func_type, 0, sizeof(WASMComponentCoreFuncType));
+            current_type->u.core_func_type = func_type;
+
+            // Parse param_types vector
+            read_leb_uint32(p, buf_end, param_count);
+            func_type->param_count = param_count;
+            if (param_count > 0) {
+                func_type->param_types = loader_malloc(param_count * sizeof(uint8), error_buf, error_buf_size);
+                if (!func_type->param_types) goto fail; // Unloader handles func_type
+                CHECK_BUF(p, buf_end, param_count);
+                for (k = 0; k < param_count; k++) {
+                    func_type->param_types[k] = *p++;
+                }
+            } else {
+                func_type->param_types = NULL;
+            }
+
+            // Parse result_types vector
+            read_leb_uint32(p, buf_end, result_count);
+            func_type->result_count = result_count;
+            if (result_count > 0) {
+                func_type->result_types = loader_malloc(result_count * sizeof(uint8), error_buf, error_buf_size);
+                if (!func_type->result_types) goto fail; // Unloader handles func_type and potentially func_type->param_types
+                CHECK_BUF(p, buf_end, result_count);
+                for (k = 0; k < result_count; k++) {
+                    func_type->result_types[k] = *p++;
+                }
+            } else {
+                func_type->result_types = NULL;
+            }
+            LOG_VERBOSE("Parsed core function type: %u params, %u results.", param_count, result_count);
+
+        } else if (current_type->kind == CORE_TYPE_KIND_MODULE) {
+            LOG_VERBOSE("Parsing core module type definition %d.", i);
+            WASMComponentCoreModuleType *module_type = NULL;
+            uint32 decl_count, j;
+            WASMComponentCoreModuleImport *temp_imports = NULL;
+            WASMComponentCoreModuleExport *temp_exports = NULL;
+            uint32 actual_import_count = 0;
+            uint32 actual_export_count = 0;
+
+            module_type = loader_malloc(sizeof(WASMComponentCoreModuleType), error_buf, error_buf_size);
+            if (!module_type) {
+                goto fail; // Main fail for load_core_type_section
+            }
+            memset(module_type, 0, sizeof(WASMComponentCoreModuleType));
+            current_type->u.module_type = module_type; // Assign early, unloader will handle if error
+
+            read_leb_uint32(p, buf_end, decl_count);
+            LOG_VERBOSE("Core module type has %u declarations.", decl_count);
+
+            if (decl_count > 0) {
+                temp_imports = loader_malloc(decl_count * sizeof(WASMComponentCoreModuleImport), error_buf, error_buf_size);
+                if (!temp_imports) goto fail; // module_type already assigned, unloader handles
+                memset(temp_imports, 0, decl_count * sizeof(WASMComponentCoreModuleImport));
+
+                temp_exports = loader_malloc(decl_count * sizeof(WASMComponentCoreModuleExport), error_buf, error_buf_size);
+                if (!temp_exports) {
+                    wasm_runtime_free(temp_imports); // temp_imports is local, free it
+                    goto fail; // module_type already assigned, unloader handles
+                }
+                memset(temp_exports, 0, decl_count * sizeof(WASMComponentCoreModuleExport));
+            }
+
+            for (j = 0; j < decl_count; j++) {
+                uint8 decl_kind_byte;
+                CHECK_BUF(p, buf_end, 1);
+                decl_kind_byte = *p++;
+
+                if (decl_kind_byte == 0x00) { /* core:import */
+                    WASMComponentCoreModuleImport *import_entry = &temp_imports[actual_import_count];
+                    if (!parse_string(&p, buf_end, &import_entry->module_name, error_buf, error_buf_size)) goto local_cleanup_fail;
+                    if (!parse_string(&p, buf_end, &import_entry->field_name, error_buf, error_buf_size)) goto local_cleanup_fail;
+                    CHECK_BUF(p, buf_end, 1);
+                    import_entry->kind = *p++;
+                    read_leb_uint32(p, buf_end, import_entry->type_idx);
+                    LOG_VERBOSE("Parsed core module import: %s.%s, kind %u, type_idx %u",
+                                import_entry->module_name, import_entry->field_name, import_entry->kind, import_entry->type_idx);
+                    actual_import_count++;
+                } else if (decl_kind_byte == 0x03) { /* core:exportdecl */
+                    WASMComponentCoreModuleExport *export_entry = &temp_exports[actual_export_count];
+                    if (!parse_string(&p, buf_end, &export_entry->name, error_buf, error_buf_size)) goto local_cleanup_fail;
+                    CHECK_BUF(p, buf_end, 1);
+                    export_entry->kind = *p++;
+                    read_leb_uint32(p, buf_end, export_entry->type_idx); /* 'idx' in spec, use as type_idx */
+                    LOG_VERBOSE("Parsed core module export: %s, kind %u, type_idx %u",
+                                export_entry->name, export_entry->kind, export_entry->type_idx);
+                    actual_export_count++;
+                } else if (decl_kind_byte == 0x01) { /* type */
+                    uint32 dummy_idx;
+                    LOG_VERBOSE("Skipping core:moduledecl kind 0x01 (type).");
+                    read_leb_uint32(p, buf_end, dummy_idx);
+                } else if (decl_kind_byte == 0x02) { /* alias */
+                    LOG_VERBOSE("Skipping core:moduledecl kind 0x02 (alias) is not supported.");
+                    set_error_buf(error_buf, error_buf_size, "Unsupported core:moduledecl kind 0x02 (alias)");
+                    goto local_cleanup_fail;
+                } else {
+                    set_error_buf_v(error_buf, error_buf_size, "unknown core:moduledecl kind: %u", decl_kind_byte);
+                    goto local_cleanup_fail;
+                }
+            }
+
+            if (actual_import_count > 0) {
+                module_type->imports = loader_malloc(actual_import_count * sizeof(WASMComponentCoreModuleImport), error_buf, error_buf_size);
+                if (!module_type->imports) goto local_cleanup_fail;
+                bh_memcpy_s(module_type->imports, actual_import_count * sizeof(WASMComponentCoreModuleImport),
+                            temp_imports, actual_import_count * sizeof(WASMComponentCoreModuleImport));
+                module_type->import_count = actual_import_count;
+            }
+
+            if (actual_export_count > 0) {
+                module_type->exports = loader_malloc(actual_export_count * sizeof(WASMComponentCoreModuleExport), error_buf, error_buf_size);
+                if (!module_type->exports) {
+                     // module_type->imports may have been successfully allocated and strings transferred.
+                     // Unloader will handle module_type->imports.
+                    goto local_cleanup_fail;
+                }
+                bh_memcpy_s(module_type->exports, actual_export_count * sizeof(WASMComponentCoreModuleExport),
+                            temp_exports, actual_export_count * sizeof(WASMComponentCoreModuleExport));
+                module_type->export_count = actual_export_count;
+            }
+
+            // Success for this module type. Free temp arrays (string pointers were copied, ownership transferred)
+            if (temp_imports) wasm_runtime_free(temp_imports);
+            if (temp_exports) wasm_runtime_free(temp_exports);
+            // continue to next core_type_def
+
+        } /* end if CORE_TYPE_KIND_MODULE */
+        continue; // Added to ensure loop continues for next type if current one is not module or successfully parsed
+
+    local_cleanup_fail:
+        // This label is reached if an error occurs during parsing into temp_imports/temp_exports,
+        // or when allocating final module_type->imports/exports.
+        // Strings successfully parsed into temp_imports/temp_exports need to be freed here,
+        // as they haven't been (or failed to be) transferred to module_type.
+        // module_type itself (current_type->u.module_type) and any successfully allocated
+        // module_type->imports or module_type->exports will be handled by wasm_component_unload via the main 'fail' label.
+        if (temp_imports) {
+            // Only free strings if module_type->imports was NOT successfully populated with them.
+            // If module_type->imports is non-NULL, assume strings were transferred.
+            if (current_type->u.module_type && current_type->u.module_type->imports == NULL) {
+                for (j = 0; j < actual_import_count; j++) {
+                    if (temp_imports[j].module_name) wasm_runtime_free(temp_imports[j].module_name);
+                    if (temp_imports[j].field_name) wasm_runtime_free(temp_imports[j].field_name);
+                }
+            }
+            wasm_runtime_free(temp_imports);
+        }
+        if (temp_exports) {
+            if (current_type->u.module_type && current_type->u.module_type->exports == NULL) {
+                for (j = 0; j < actual_export_count; j++) {
+                    if (temp_exports[j].name) wasm_runtime_free(temp_exports[j].name);
+                }
+            }
+            wasm_runtime_free(temp_exports);
+        }
+        goto fail; // Go to the main fail label of load_core_type_section
+
+    } /* end for loop */
 
     *p_buf = p;
-    return true;
+    return true; // Success for load_core_type_section
+
 fail:
+    // component->core_type_defs (and thus current_type within it, and current_type->u.module_type if set)
+    // will be freed by wasm_component_unload if the overall component loading fails.
     return false;
 }
 
@@ -1588,15 +1832,105 @@ load_canonical_section(const uint8 **p_buf, const uint8 *buf_end,
 
     for (i = 0; i < canonical_count; i++) {
         WASMComponentCanonical *current_canon = &component->canonicals[i];
-        uint8 kind_byte;
+        uint8 kind_byte, sort_byte, async_byte_temp;
+        memset(&current_canon->u, 0, sizeof(current_canon->u)); // Initialize union
+
         CHECK_BUF(p, buf_end, 1); /* func_kind */
         kind_byte = *p++;
         current_canon->func_kind = (WASMCanonicalFuncKind)kind_byte;
 
-        read_leb_uint32(p, buf_end, current_canon->core_func_idx);
-        read_leb_uint32(p, buf_end, current_canon->component_func_type_idx);
-        read_leb_uint32(p, buf_end, current_canon->option_count);
+        LOG_VERBOSE("Parsing canonical function %u, kind 0x%02X", i, current_canon->func_kind);
 
+        switch (current_canon->func_kind) {
+            case CANONICAL_FUNC_KIND_LIFT: // 0x00
+                CHECK_BUF(p, buf_end, 1); // core sort byte (must be 0x00 for func)
+                sort_byte = *p++;
+                if (sort_byte != 0x00) {
+                    set_error_buf_v(error_buf, error_buf_size, "unexpected sort byte 0x%02X for LIFT kind", sort_byte);
+                    goto fail;
+                }
+                read_leb_uint32(p, buf_end, current_canon->u.lift.core_func_idx);
+                // Options are parsed after specific fields for LIFT
+                break;
+            case CANONICAL_FUNC_KIND_LOWER: // 0x01
+                CHECK_BUF(p, buf_end, 1); // core sort byte (must be 0x00 for func)
+                sort_byte = *p++;
+                if (sort_byte != 0x00) {
+                    set_error_buf_v(error_buf, error_buf_size, "unexpected sort byte 0x%02X for LOWER kind", sort_byte);
+                    goto fail;
+                }
+                read_leb_uint32(p, buf_end, current_canon->u.lower.component_func_idx);
+                // Options are parsed after specific fields for LOWER
+                break;
+            case CANONICAL_FUNC_KIND_RESOURCE_NEW:      // 0x02
+            case CANONICAL_FUNC_KIND_RESOURCE_DROP:     // 0x03
+            case CANONICAL_FUNC_KIND_RESOURCE_REP:      // 0x04
+            case CANONICAL_FUNC_KIND_RESOURCE_DROP_ASYNC: // 0x07
+            case CANONICAL_FUNC_KIND_STREAM_NEW:        // 0x0E
+            case CANONICAL_FUNC_KIND_STREAM_READ:       // 0x0F
+            case CANONICAL_FUNC_KIND_STREAM_WRITE:      // 0x10
+            case CANONICAL_FUNC_KIND_STREAM_CANCEL_READ: // 0x11
+            case CANONICAL_FUNC_KIND_STREAM_CANCEL_WRITE: // 0x12
+            case CANONICAL_FUNC_KIND_STREAM_CLOSE_READABLE: // 0x13
+            case CANONICAL_FUNC_KIND_STREAM_CLOSE_WRITABLE: // 0x14
+            case CANONICAL_FUNC_KIND_FUTURE_NEW:        // 0x15
+            case CANONICAL_FUNC_KIND_FUTURE_READ:       // 0x16
+            case CANONICAL_FUNC_KIND_FUTURE_WRITE:      // 0x17
+            case CANONICAL_FUNC_KIND_FUTURE_CANCEL_READ: // 0x18
+            case CANONICAL_FUNC_KIND_FUTURE_CANCEL_WRITE: // 0x19
+            case CANONICAL_FUNC_KIND_FUTURE_CLOSE_READABLE: // 0x1A
+            case CANONICAL_FUNC_KIND_FUTURE_CLOSE_WRITABLE: // 0x1B
+            case CANONICAL_FUNC_KIND_THREAD_SPAWN_REF:  // 0x40
+                read_leb_uint32(p, buf_end, current_canon->u.type_idx_op.type_idx);
+                // Options parsed after
+                break;
+            case CANONICAL_FUNC_KIND_CONTEXT_GET:       // 0x0A
+            case CANONICAL_FUNC_KIND_CONTEXT_SET:       // 0x0B
+                read_leb_uint32(p, buf_end, current_canon->u.context_op.context_op_idx);
+                // Options parsed after
+                break;
+            case CANONICAL_FUNC_KIND_WAITABLE_SET_WAIT: // 0x20
+            case CANONICAL_FUNC_KIND_WAITABLE_SET_POLL: // 0x21
+                CHECK_BUF(p, buf_end, 1); // async_opt byte
+                current_canon->u.waitable_mem_op.async_opt = *p++;
+                read_leb_uint32(p, buf_end, current_canon->u.waitable_mem_op.mem_idx);
+                // Options parsed after
+                break;
+            case CANONICAL_FUNC_KIND_THREAD_SPAWN_INDIRECT: // 0x41
+                read_leb_uint32(p, buf_end, current_canon->u.thread_spawn_indirect_op.type_idx);
+                read_leb_uint32(p, buf_end, current_canon->u.thread_spawn_indirect_op.table_idx);
+                // Options parsed after
+                break;
+            case CANONICAL_FUNC_KIND_SUBTASK_CANCEL:    // 0x06
+            case CANONICAL_FUNC_KIND_YIELD:             // 0x0C
+                CHECK_BUF(p, buf_end, 1); // async? byte
+                async_byte_temp = *p++;
+                LOG_VERBOSE("Parsed async? byte 0x%02X for kind 0x%02X", async_byte_temp, current_canon->func_kind);
+                // This async_byte_temp is not stored in the union struct as per current definition.
+                // If it needs to be stored, WASMComponentCanonical or its union needs a field.
+                // Options parsed after
+                break;
+            case CANONICAL_FUNC_KIND_TASK_CANCEL:       // 0x05
+            case CANONICAL_FUNC_KIND_BACKPRESSURE_SET:  // 0x08
+            case CANONICAL_FUNC_KIND_TASK_RETURN:       // 0x09
+            case CANONICAL_FUNC_KIND_SUBTASK_DROP:      // 0x0D
+            case CANONICAL_FUNC_KIND_ERROR_CONTEXT_NEW: // 0x1C
+            case CANONICAL_FUNC_KIND_ERROR_CONTEXT_DEBUG_MESSAGE: // 0x1D
+            case CANONICAL_FUNC_KIND_ERROR_CONTEXT_DROP: // 0x1E
+            case CANONICAL_FUNC_KIND_WAITABLE_SET_NEW:  // 0x1F
+            case CANONICAL_FUNC_KIND_WAITABLE_SET_DROP: // 0x22
+            case CANONICAL_FUNC_KIND_WAITABLE_JOIN:     // 0x23
+            case CANONICAL_FUNC_KIND_THREAD_AVAILABLE_PARALLELISM: // 0x42
+                // These kinds primarily use options or have no specific fields before options.
+                // Parsing proceeds directly to options.
+                break;
+            default:
+                set_error_buf_v(error_buf, error_buf_size, "unknown or unsupported canonical func kind: 0x%02X", current_canon->func_kind);
+                goto fail;
+        }
+
+        // Common parsing for options
+        read_leb_uint32(p, buf_end, current_canon->option_count);
         if (current_canon->option_count > 0) {
             current_canon->options = loader_malloc(
                 current_canon->option_count * sizeof(WASMComponentCanonicalOption), error_buf, error_buf_size);
@@ -1610,26 +1944,40 @@ load_canonical_section(const uint8 **p_buf, const uint8 *buf_end,
                 CHECK_BUF(p, buf_end, 1);
                 opt_kind_byte = *p++;
                 opt->kind = (WASMComponentCanonicalOptionKind)opt_kind_byte;
+                opt->value = 0; // Initialize value, might not be set for all kinds
+
                 switch (opt->kind) {
                     case CANONICAL_OPTION_STRING_ENCODING_UTF8:
                     case CANONICAL_OPTION_STRING_ENCODING_UTF16:
+                    case CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16: // New
                     case CANONICAL_OPTION_STRING_ENCODING_COMPACT_UTF16:
+                    case CANONICAL_OPTION_ASYNC: // New
+                    case CANONICAL_OPTION_ALWAYS_TASK_RETURN: // New
                         /* No value to read for these */
+                        LOG_VERBOSE("Parsed option kind 0x%02X (no value)", opt->kind);
                         break;
                     case CANONICAL_OPTION_MEMORY_IDX:
                     case CANONICAL_OPTION_REALLOC_FUNC_IDX:
                     case CANONICAL_OPTION_POST_RETURN_FUNC_IDX:
+                    case CANONICAL_OPTION_CALLBACK_FUNC_IDX: // New
                         read_leb_uint32(p, buf_end, opt->value);
+                        LOG_VERBOSE("Parsed option kind 0x%02X with value %u", opt->kind, opt->value);
                         break;
                     default:
-                        set_error_buf_v(error_buf, error_buf_size, "unknown canonical option kind: %u", opt->kind);
+                        set_error_buf_v(error_buf, error_buf_size, "unknown canonical option kind: 0x%02X", opt->kind);
                         goto fail;
                 }
             }
+        } else {
+            current_canon->options = NULL;
         }
-        LOG_VERBOSE("Canonical func %u: kind %s, core_func %u, comp_func_type %u, options %u",
-                    i, current_canon->func_kind == CANONICAL_FUNC_KIND_LIFT ? "lift" : "lower",
-                    current_canon->core_func_idx, current_canon->component_func_type_idx, current_canon->option_count);
+
+        // Final parsing for LIFT after options
+        if (current_canon->func_kind == CANONICAL_FUNC_KIND_LIFT) {
+            read_leb_uint32(p, buf_end, current_canon->u.lift.component_func_type_idx);
+        }
+        LOG_VERBOSE("Successfully parsed canonical func %u, kind 0x%02X, with %u options",
+                    i, current_canon->func_kind, current_canon->option_count);
     }
     *p_buf = p;
     return true;
@@ -2019,7 +2367,46 @@ wasm_component_unload(WASMComponent *component)
         wasm_runtime_free(component->core_instances);
     }
 
-    if (component->core_type_defs) { /* Simple structs, no deep free needed for now */
+    if (component->core_type_defs) {
+        for (uint32 i = 0; i < component->core_type_def_count; i++) {
+            WASMComponentCoreTypeDef *core_type_def = &component->core_type_defs[i];
+            if (core_type_def->kind == CORE_TYPE_KIND_MODULE && core_type_def->u.module_type) {
+                WASMComponentCoreModuleType *module_type = core_type_def->u.module_type;
+                if (module_type->imports) {
+                    for (uint32 j = 0; j < module_type->import_count; j++) {
+                        if (module_type->imports[j].module_name) {
+                            wasm_runtime_free(module_type->imports[j].module_name);
+                        }
+                        if (module_type->imports[j].field_name) {
+                            wasm_runtime_free(module_type->imports[j].field_name);
+                        }
+                    }
+                    wasm_runtime_free(module_type->imports);
+                }
+                if (module_type->exports) {
+                    for (uint32 j = 0; j < module_type->export_count; j++) {
+                        if (module_type->exports[j].name) {
+                            wasm_runtime_free(module_type->exports[j].name);
+                        }
+                    }
+                    wasm_runtime_free(module_type->exports);
+                }
+                wasm_runtime_free(module_type);
+                core_type_def->u.module_type = NULL;
+            }
+            /* Add other kind-specific frees here if WASMComponentCoreTypeDef.u grows */
+            else if (core_type_def->kind == 0x60 && core_type_def->u.core_func_type) { /* Core Function Type */
+                WASMComponentCoreFuncType *func_type = core_type_def->u.core_func_type;
+                if (func_type->param_types) {
+                    wasm_runtime_free(func_type->param_types);
+                }
+                if (func_type->result_types) {
+                    wasm_runtime_free(func_type->result_types);
+                }
+                wasm_runtime_free(func_type);
+                core_type_def->u.core_func_type = NULL;
+            }
+        }
         wasm_runtime_free(component->core_type_defs);
     }
 

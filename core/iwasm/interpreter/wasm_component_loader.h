@@ -52,10 +52,10 @@ typedef struct WASMComponentCoreModule {
 /* Argument for instantiating a core module */
 typedef struct WASMComponentCoreInstanceArg {
     char *name;       /* name of the import */
+    uint8 kind;       /* kind of the import (e.g., WASM_EXTERNAL_FUNCTION from wasm.h), derived during loading by looking up 'name' in the target core module's imports. */
     uint32 instance_idx; /* index of the item (e.g., func, table, memory, global)
                             provided for the import. This could be an alias
                             or an item from another instance. */
-    /* uint8 kind; TODO: to specify what kind of item instance_idx refers to, if needed beyond name */
 } WASMComponentCoreInstanceArg;
 
 /* Inline export from a core module instance */
@@ -86,15 +86,58 @@ typedef struct WASMComponentCoreInstance {
     } u;
 } WASMComponentCoreInstance;
 
-/* Structure for a Core Type Section item (e.g. core function types) */
-/* Represents a core:type definition (e.g., core function type, core module type) */
+/* Forward declarations for types used in WASMComponentCoreTypeDef */
+struct WASMComponentCoreFuncType;
+struct WASMComponentCoreModuleType;
+
+/* Represents a core function type (param and result types) */
+typedef struct WASMComponentCoreFuncType {
+    uint32 param_count;
+    uint8 *param_types; /* Array of core value types (e.g., VALUE_TYPE_I32 from wasm.h) */
+    uint32 result_count;
+    uint8 *result_types; /* Array of core value types */
+} WASMComponentCoreFuncType;
+
+/* Represents an individual export of a core module type */
+typedef struct WASMComponentCoreModuleExport {
+    char *name;
+    uint8 kind; /* e.g., WASM_EXTERNAL_FUNCTION, WASM_EXTERNAL_TABLE, etc. from wasm.h */
+    uint32 type_idx; /* Index to a WASMComponentCoreTypeDef (e.g., for function signature)
+                        or other type description as applicable. For non-func kinds,
+                        this might need further refinement or a union if detailed
+                        type info (beyond kind) is stored directly. */
+} WASMComponentCoreModuleExport;
+
+/* Represents an individual import of a core module type */
+typedef struct WASMComponentCoreModuleImport {
+    char *module_name;
+    char *field_name;
+    uint8 kind; /* e.g., WASM_EXTERNAL_FUNCTION, WASM_EXTERNAL_TABLE, etc. from wasm.h */
+    uint32 type_idx; /* Index to a WASMComponentCoreTypeDef (e.g., for function signature)
+                        or other type description. Similar to export, non-func kinds
+                        might need more detail here. */
+} WASMComponentCoreModuleImport;
+
+/* Represents a core module type, detailing its imports and exports */
+typedef struct WASMComponentCoreModuleType {
+    uint32 import_count;
+    WASMComponentCoreModuleImport *imports;
+    uint32 export_count;
+    WASMComponentCoreModuleExport *exports;
+} WASMComponentCoreModuleType;
+
+/* Define for the new core module type kind */
+#define CORE_TYPE_KIND_MODULE 0x50
+
+/* Structure for a Core Type Section item (e.g. core function types, core module types) */
+/* Represents a core:type definition */
 typedef struct WASMComponentCoreTypeDef {
-    /* TODO: Define actual structures for core:func, core:module, etc.
-       For now, this is a placeholder if we only store raw type data or a tag.
-       A full implementation would parse out parameters/results for core func types.
-    */
-    uint8 kind; /* e.g. 0x60 for func, or a custom kind for core module type */
-    /* void *type_definition; // Pointer to a more specific struct */
+    uint8 kind; /* e.g., 0x60 for core func type, CORE_TYPE_KIND_MODULE for core module type */
+    union {
+        struct WASMComponentCoreFuncType *core_func_type; /* For core function type (kind == 0x60) */
+        WASMComponentCoreModuleType *module_type;       /* For core module type (kind == CORE_TYPE_KIND_MODULE) */
+        /* Add other core type structures as needed */
+    } u;
 } WASMComponentCoreTypeDef;
 
 /* Structure for a Component Section item (nested component) */
@@ -320,8 +363,7 @@ typedef struct WASMComponentDefinedType {
         struct WASMComponentComponentType *comp_type;
         struct WASMComponentInstanceType *inst_type;
         WASMComponentResourceType res_type;
-        /* TODO: Add core_module_type if it's to be parsed elaborately */
-        /* WASMComponentCoreModuleType core_module_type; */
+        WASMComponentCoreModuleType *core_module_type; /* For DEF_TYPE_KIND_CORE_MODULE */
     } u;
 } WASMComponentDefinedType;
 
@@ -441,31 +483,111 @@ struct WASMComponentInstanceType {
 
 /* Canonical Function Options */
 typedef enum WASMComponentCanonicalOptionKind {
-    CANONICAL_OPTION_STRING_ENCODING_UTF8,
-    CANONICAL_OPTION_STRING_ENCODING_UTF16,
-    CANONICAL_OPTION_STRING_ENCODING_COMPACT_UTF16,
-    CANONICAL_OPTION_MEMORY_IDX,    /* value is core memory index */
-    CANONICAL_OPTION_REALLOC_FUNC_IDX, /* value is core func index for realloc */
-    CANONICAL_OPTION_POST_RETURN_FUNC_IDX /* value is core func index for post-return */
+    CANONICAL_OPTION_STRING_ENCODING_UTF8 = 0x00,
+    CANONICAL_OPTION_STRING_ENCODING_UTF16 = 0x01,
+    CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16 = 0x02, // New
+    CANONICAL_OPTION_STRING_ENCODING_COMPACT_UTF16 = 0x03, // Value was 0x02, now 0x03
+    CANONICAL_OPTION_MEMORY_IDX = 0x04,    /* value is core memory index */
+    CANONICAL_OPTION_REALLOC_FUNC_IDX = 0x05, /* value is core func index for realloc */
+    CANONICAL_OPTION_POST_RETURN_FUNC_IDX = 0x06, /* value is core func index for post-return */
+    CANONICAL_OPTION_ASYNC = 0x07, /* No value, indicates async behavior. Value was 0x06 in problem, made 0x07 to avoid clash */
+    CANONICAL_OPTION_CALLBACK_FUNC_IDX = 0x08, /* value is func_idx. Value was 0x07 in problem, made 0x08 */
+    CANONICAL_OPTION_ALWAYS_TASK_RETURN = 0x09 /* No value. Value was 0x08 in problem, made 0x09 */
 } WASMComponentCanonicalOptionKind;
 
 typedef struct WASMComponentCanonicalOption {
     WASMComponentCanonicalOptionKind kind;
-    uint32 value; /* For idx options */
+    uint32 value; /* For idx options, ignored for options without a value */
 } WASMComponentCanonicalOption;
 
 /* Structure for a Canonical Section item (Canonical ABI functions) */
 typedef enum WASMCanonicalFuncKind {
-    CANONICAL_FUNC_KIND_LIFT = 0x00,
-    CANONICAL_FUNC_KIND_LOWER = 0x01
+    CANONICAL_FUNC_KIND_LIFT = 0x00, // lift (core_func_idx, options, component_func_type_idx)
+    CANONICAL_FUNC_KIND_LOWER = 0x01, // lower (component_func_idx, options) -> core func
+    CANONICAL_FUNC_KIND_RESOURCE_NEW = 0x02,      // resource.new (resource_type_idx) -> core func
+    CANONICAL_FUNC_KIND_RESOURCE_DROP = 0x03,     // resource.drop (resource_type_idx) -> core func
+    CANONICAL_FUNC_KIND_RESOURCE_REP = 0x04,      // resource.rep (resource_type_idx) -> core func
+    CANONICAL_FUNC_KIND_TASK_CANCEL = 0x05,       // task.cancel -> core func
+    CANONICAL_FUNC_KIND_SUBTASK_CANCEL = 0x06,    // subtask.cancel -> core func
+    CANONICAL_FUNC_KIND_RESOURCE_DROP_ASYNC = 0x07, // resource.drop async (resource_type_idx) -> core func
+    CANONICAL_FUNC_KIND_BACKPRESSURE_SET = 0x08,  // backpressure.set -> core func
+    CANONICAL_FUNC_KIND_TASK_RETURN = 0x09,       // task.return (opts) -> core func
+    CANONICAL_FUNC_KIND_CONTEXT_GET = 0x0A,       // context.get i32 (idx) -> core func
+    CANONICAL_FUNC_KIND_CONTEXT_SET = 0x0B,       // context.set i32 (idx) -> core func
+    CANONICAL_FUNC_KIND_YIELD = 0x0C,             // yield -> core func
+    CANONICAL_FUNC_KIND_SUBTASK_DROP = 0x0D,      // subtask.drop -> core func
+    CANONICAL_FUNC_KIND_STREAM_NEW = 0x0E,        // stream.new (type_idx) -> core func
+    CANONICAL_FUNC_KIND_STREAM_READ = 0x0F,       // stream.read (type_idx, opts) -> core func
+    CANONICAL_FUNC_KIND_STREAM_WRITE = 0x10,      // stream.write (type_idx, opts) -> core func
+    CANONICAL_FUNC_KIND_STREAM_CANCEL_READ = 0x11, // stream.cancel-read (type_idx) -> core func
+    CANONICAL_FUNC_KIND_STREAM_CANCEL_WRITE = 0x12, // stream.cancel-write (type_idx) -> core func
+    CANONICAL_FUNC_KIND_STREAM_CLOSE_READABLE = 0x13, // stream.close-readable (type_idx) -> core func
+    CANONICAL_FUNC_KIND_STREAM_CLOSE_WRITABLE = 0x14, // stream.close-writable (type_idx) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_NEW = 0x15,        // future.new (type_idx) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_READ = 0x16,       // future.read (type_idx, opts) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_WRITE = 0x17,      // future.write (type_idx, opts) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_CANCEL_READ = 0x18, // future.cancel-read (type_idx) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_CANCEL_WRITE = 0x19, // future.cancel-write (type_idx) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_CLOSE_READABLE = 0x1A, // future.close-readable (type_idx) -> core func
+    CANONICAL_FUNC_KIND_FUTURE_CLOSE_WRITABLE = 0x1B, // future.close-writable (type_idx) -> core func
+    CANONICAL_FUNC_KIND_ERROR_CONTEXT_NEW = 0x1C, // error-context.new (opts) -> core func
+    CANONICAL_FUNC_KIND_ERROR_CONTEXT_DEBUG_MESSAGE = 0x1D, // error-context.debug-message (opts) -> core func
+    CANONICAL_FUNC_KIND_ERROR_CONTEXT_DROP = 0x1E, // error-context.drop -> core func
+    CANONICAL_FUNC_KIND_WAITABLE_SET_NEW = 0x1F,  // waitable-set.new -> core func
+    CANONICAL_FUNC_KIND_WAITABLE_SET_WAIT = 0x20, // waitable-set.wait (async?, memidx, opts) -> core func
+    CANONICAL_FUNC_KIND_WAITABLE_SET_POLL = 0x21, // waitable-set.poll (async?, memidx, opts) -> core func
+    CANONICAL_FUNC_KIND_WAITABLE_SET_DROP = 0x22, // waitable-set.drop -> core func
+    CANONICAL_FUNC_KIND_WAITABLE_JOIN = 0x23,     // waitable.join -> core func
+    CANONICAL_FUNC_KIND_THREAD_SPAWN_REF = 0x40,  // thread.spawn_ref (typeidx, opts) -> core func
+    CANONICAL_FUNC_KIND_THREAD_SPAWN_INDIRECT = 0x41, // thread.spawn_indirect (typeidx, tableidx, opts) -> core func
+    CANONICAL_FUNC_KIND_THREAD_AVAILABLE_PARALLELISM = 0x42 // thread.available_parallelism (opts) -> core func
 } WASMCanonicalFuncKind;
 
 typedef struct WASMComponentCanonical {
-    WASMCanonicalFuncKind func_kind; /* lift or lower */
-    uint32 core_func_idx;      /* Index to the core function */
-    uint32 component_func_type_idx; /* Index to a component function type in a type section */
+    WASMCanonicalFuncKind func_kind;
     uint32 option_count;
-    WASMComponentCanonicalOption *options;
+    WASMComponentCanonicalOption *options; // Common to many kinds
+    union {
+        struct { // For LIFT (0x00)
+            uint32 core_func_idx;
+            uint32 component_func_type_idx;
+        } lift;
+        struct { // For LOWER (0x01)
+            uint32 component_func_idx;
+        } lower;
+        struct { // For RESOURCE_NEW (0x02), RESOURCE_DROP (0x03), RESOURCE_REP (0x04),
+                 // STREAM_NEW (0x0E), STREAM_READ (0x0F), STREAM_WRITE (0x10),
+                 // STREAM_CANCEL_READ (0x11), STREAM_CANCEL_WRITE (0x12),
+                 // STREAM_CLOSE_READABLE (0x13), STREAM_CLOSE_WRITABLE (0x14),
+                 // FUTURE_NEW (0x15), ... FUTURE_CLOSE_WRITABLE (0x1B),
+                 // THREAD_SPAWN_REF (0x40), RESOURCE_DROP_ASYNC (0x07)
+            uint32 type_idx; // Represents rt (resource type index) or general type_idx
+        } type_idx_op;
+        struct { // For CONTEXT_GET (0x0A), CONTEXT_SET (0x0B)
+            uint32 context_op_idx;
+        } context_op;
+        struct { // For WAITABLE_SET_WAIT (0x20), WAITABLE_SET_POLL (0x21)
+            uint8 async_opt; // 0x00 or 0x01, (directly parsed, not an option)
+            uint32 mem_idx;
+        } waitable_mem_op;
+        struct { // For THREAD_SPAWN_INDIRECT (0x41)
+            uint32 type_idx;
+            uint32 table_idx;
+        } thread_spawn_indirect_op;
+        /* Kinds like TASK_CANCEL (0x05), SUBTASK_CANCEL (0x06), BACKPRESSURE_SET (0x08),
+           TASK_RETURN (0x09), YIELD (0x0C), SUBTASK_DROP (0x0D), ERROR_CONTEXT_NEW (0x1C),
+           ERROR_CONTEXT_DEBUG_MESSAGE (0x1D), ERROR_CONTEXT_DROP (0x1E),
+           WAITABLE_SET_NEW (0x1F), WAITABLE_SET_DROP (0x22), WAITABLE_JOIN (0x23),
+           THREAD_AVAILABLE_PARALLELISM (0x42)
+           may only use options or have no specific fields other than what's parsed before options.
+           For example, YIELD has an 'async?' byte that might be parsed before options.
+           If a kind has a direct 'async?' flag (like YIELD async?), it should be parsed before options.
+           However, the new CANONICAL_OPTION_ASYNC suggests 'async' is an option.
+           For this structure, direct fields are preferred if they are not part of the 'opts' vector.
+           Revisit specific parsing based on Binary.md details for each.
+           For now, this union covers explicitly field-taking kinds.
+        */
+    } u;
 } WASMComponentCanonical;
 
 /* Structure for a Start Section item (Component Start Function) */

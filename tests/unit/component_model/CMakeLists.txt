@@ -4,6 +4,8 @@
 # Add more test files here if needed
 set(COMPONENT_MODEL_TEST_SOURCES
     canonical_section_test.cc
+    core_type_parsing_test.cc
+    core_instance_linking_test.cc
 )
 
 # Link with common test utilities and gtest
