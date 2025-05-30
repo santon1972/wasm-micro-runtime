@@ -4,7 +4,7 @@
  */
 
 #include "wasm_component_runtime.h"
-#include "wasm_component_loader.h" /* For WASMComponent structure details */
+#include "../include/wasm_component_loader.h" // Changed to include the new header
 #include "wasm_runtime.h"          /* For wasm_instantiate, wasm_deinstantiate */
 #include "wasm_loader.h"           /* For wasm_module_destroy (if needed for component def) */
 #include "../common/bh_log.h"
@@ -15,6 +15,210 @@
 // Helper to set component runtime error messages
 static void
 set_comp_rt_error(char *error_buf, uint32 error_buf_size, const char *message); // Keep FWD decl
+
+// Forward declarations for recursive calls or new helpers
+static bool component_type_compatible(WASMComponentComponentType *expected_comp_type,
+                                      WASMComponent *actual_comp_def,
+                                      WASMComponent *outer_component_def_context,
+                                      char* error_buf, uint32 error_buf_size);
+static bool component_func_type_compatible(WASMComponentFuncType *expected_func_type,
+                                           WASMComponentFuncType *actual_func_type,
+                                           WASMComponent *expected_defining_component,
+                                           WASMComponent *actual_defining_component,
+                                           char* error_buf, uint32 error_buf_size);
+static bool core_global_type_compatible_with_component_val_type(WASMComponentValType *expected_val_type,
+                                                                WASMGlobalInstance *actual_core_global,
+                                                                WASMComponent *expected_defining_component,
+                                                                char* error_buf, uint32 error_buf_size);
+
+// New helper function
+static bool
+core_component_func_type_compatible_with_core_func_type(WASMComponentCoreFuncType* expected_comp_core_func_type,
+                                                        WASMType* actual_core_func_type,
+                                                        char* error_buf, uint32 error_buf_size)
+{
+    if (!expected_comp_core_func_type || !actual_core_func_type) {
+        set_comp_rt_error(error_buf, error_buf_size, "NULL function type inputs to core_component_func_type_compatible_with_core_func_type.");
+        return false;
+    }
+
+    // Compare param counts
+    if (expected_comp_core_func_type->param_count != actual_core_func_type->param_count) {
+        set_comp_rt_error_v(error_buf, error_buf_size, "Core function type param count mismatch. Expected %d, actual %d.",
+                           expected_comp_core_func_type->param_count, actual_core_func_type->param_count);
+        return false;
+    }
+
+    // Compare param types
+    for (uint32 i = 0; i < expected_comp_core_func_type->param_count; ++i) {
+        if (expected_comp_core_func_type->param_types[i] != actual_core_func_type->types[i]) {
+            set_comp_rt_error_v(error_buf, error_buf_size, "Core function type param type mismatch at index %d. Expected 0x%02X, actual 0x%02X.",
+                               i, expected_comp_core_func_type->param_types[i], actual_core_func_type->types[i]);
+            return false;
+        }
+    }
+
+    // Compare result counts
+    if (expected_comp_core_func_type->result_count != actual_core_func_type->result_count) {
+        set_comp_rt_error_v(error_buf, error_buf_size, "Core function type result count mismatch. Expected %d, actual %d.",
+                           expected_comp_core_func_type->result_count, actual_core_func_type->result_count);
+        return false;
+    }
+
+    // Compare result types
+    // Actual core func type stores results after params in the same `types` array.
+    uint32 actual_core_result_type_offset = actual_core_func_type->param_count;
+    for (uint32 i = 0; i < expected_comp_core_func_type->result_count; ++i) {
+        if (expected_comp_core_func_type->result_types[i] != actual_core_func_type->types[actual_core_result_type_offset + i]) {
+            set_comp_rt_error_v(error_buf, error_buf_size, "Core function type result type mismatch at index %d. Expected 0x%02X, actual 0x%02X.",
+                               i, expected_comp_core_func_type->result_types[i], actual_core_func_type->types[actual_core_result_type_offset + i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Implementation for core module type compatibility
+static bool
+core_module_type_compatible(WASMComponentCoreModuleType *expected_cmt,
+                            WASMModuleInstance *actual_core_module_inst,
+                            WASMComponent *defining_component_context, // Context for expected_cmt's type_idx resolution
+                            char *error_buf, uint32 error_buf_size)
+{
+    uint32 i, k;
+    WASMModule *actual_module = actual_core_module_inst->module;
+
+    // Check imports
+    for (i = 0; i < expected_cmt->import_count; ++i) {
+        WASMComponentCoreModuleImport *expected_import = &expected_cmt->imports[i];
+        WASMImport *actual_import = NULL;
+
+        for (k = 0; k < actual_module->import_count; ++k) {
+            if (strcmp(actual_module->imports[k].module_name, expected_import->module_name) == 0 &&
+                strcmp(actual_module->imports[k].field_name, expected_import->field_name) == 0) {
+                actual_import = &actual_module->imports[k];
+                break;
+            }
+        }
+
+        if (!actual_import) {
+            set_comp_rt_error_v(error_buf, error_buf_size, "Expected core module import '%s':'%s' not found in actual module.",
+                               expected_import->module_name, expected_import->field_name);
+            return false;
+        }
+
+        if (expected_import->kind != actual_import->kind) {
+            set_comp_rt_error_v(error_buf, error_buf_size, "Core module import '%s':'%s' kind mismatch. Expected %d, actual %d.",
+                               expected_import->module_name, expected_import->field_name, expected_import->kind, actual_import->kind);
+            return false;
+        }
+
+        switch (expected_import->kind) {
+            case WASM_IMPORT_KIND_FUNC:
+            {
+                // Ensure type_idx is valid for the defining_component_context's core_types array
+                if (expected_import->type_idx >= defining_component_context->core_type_count) {
+                     set_comp_rt_error_v(error_buf, error_buf_size, "Invalid type_idx %u for expected core func import '%s':'%s' (core_type_count %u).",
+                                        expected_import->type_idx, expected_import->module_name, expected_import->field_name, defining_component_context->core_type_count);
+                     return false;
+                }
+                // Ensure the type at type_idx is actually a core function type
+                if (defining_component_context->core_types[expected_import->type_idx].kind != WASM_COMPONENT_CORE_FUNC_TYPE_KIND) {
+                     set_comp_rt_error_v(error_buf, error_buf_size, "Type at type_idx %u for expected core func import '%s':'%s' is not a core func type (kind %u).",
+                                        expected_import->type_idx, expected_import->module_name, expected_import->field_name,
+                                        defining_component_context->core_types[expected_import->type_idx].kind);
+                     return false;
+                }
+                WASMComponentCoreFuncType *expected_core_func_type = &defining_component_context->core_types[expected_import->type_idx].u.core_type_def.func_type;
+                if (!core_component_func_type_compatible_with_core_func_type(expected_core_func_type, actual_import->u.function.func_type, error_buf, error_buf_size)) {
+                   return false;
+                }
+                break;
+            }
+            case WASM_IMPORT_KIND_TABLE:
+                // Compare actual_import->u.table with expected type
+                // Expected type needs to be resolved from expected_import->type_idx if it pointed to a table type def
+                LOG_TODO("Detailed type check for imported core table in core_module_type_compatible.");
+                break;
+            case WASM_IMPORT_KIND_MEMORY:
+                LOG_TODO("Detailed type check for imported core memory in core_module_type_compatible.");
+                break;
+            case WASM_IMPORT_KIND_GLOBAL:
+                LOG_TODO("Detailed type check for imported core global in core_module_type_compatible.");
+                break;
+            default:
+                set_comp_rt_error_v(error_buf, error_buf_size, "Unsupported import kind %d for core module type compatibility.", expected_import->kind);
+                return false;
+        }
+    }
+
+    // Check exports
+    for (i = 0; i < expected_cmt->export_count; ++i) {
+        WASMComponentCoreModuleExport *expected_export = &expected_cmt->exports[i];
+        bool found_export = false;
+
+        switch (expected_export->kind) {
+            case WASM_EXPORT_KIND_FUNC:
+            {
+                for (k = 0; k < actual_module_inst->export_func_count; ++k) {
+                    if (strcmp(actual_module_inst->export_functions[k].name, expected_export->name) == 0) {
+                        if (expected_export->type_idx >= defining_component_context->core_type_count ||
+                            defining_component_context->core_types[expected_export->type_idx].kind != WASM_COMPONENT_CORE_FUNC_TYPE_KIND) {
+                            set_comp_rt_error_v(error_buf, error_buf_size, "Invalid type_idx %d for expected core func export '%s'.",
+                                                expected_export->type_idx, expected_export->name);
+                            return false;
+                        }
+                        WASMComponentCoreFuncType* expected_core_func_type = &defining_component_context->core_types[expected_export->type_idx].u.core_type_def.func_type;
+                        WASMFunctionInstance* actual_func_inst = actual_module_inst->export_functions[k].function;
+                        if (!core_component_func_type_compatible_with_core_func_type(expected_core_func_type, actual_func_inst->u.func.func_type_linked, error_buf, error_buf_size)) {
+                           return false;
+                        }
+                        found_export = true;
+                        break;
+                    }
+                }
+                break;
+            }
+            case WASM_EXPORT_KIND_TABLE:
+                 for (k = 0; k < actual_module_inst->export_table_count; ++k) {
+                    if (strcmp(actual_module_inst->export_tables[k].name, expected_export->name) == 0) {
+                        LOG_TODO("Detailed type check for exported core table in core_module_type_compatible.");
+                        found_export = true;
+                        break;
+                    }
+                }
+                break;
+            case WASM_EXPORT_KIND_MEMORY:
+                for (k = 0; k < actual_module_inst->export_memory_count; ++k) {
+                    if (strcmp(actual_module_inst->export_memories[k].name, expected_export->name) == 0) {
+                        LOG_TODO("Detailed type check for exported core memory in core_module_type_compatible.");
+                        found_export = true;
+                        break;
+                    }
+                }
+                break;
+            case WASM_EXPORT_KIND_GLOBAL:
+                for (k = 0; k < actual_module_inst->export_global_count; ++k) {
+                    if (strcmp(actual_module_inst->export_globals[k].name, expected_export->name) == 0) {
+                        LOG_TODO("Detailed type check for exported core global in core_module_type_compatible.");
+                        found_export = true;
+                        break;
+                    }
+                }
+                break;
+            default:
+                set_comp_rt_error_v(error_buf, error_buf_size, "Unsupported export kind %d for core module type compatibility.", expected_export->kind);
+                return false;
+        }
+        if (!found_export) {
+            set_comp_rt_error_v(error_buf, error_buf_size, "Expected core module export '%s' (kind %d) not found in actual module instance.",
+                               expected_export->name, expected_export->kind);
+            return false;
+        }
+    }
+
+    return true;
+}
 
 // Static helper functions for finding exported items in a module instance
 static WASMFunctionInstance *
@@ -329,77 +533,114 @@ wasm_component_instance_instantiate(
                                         // If item.function is a WASMFunctionInstance, its is_native and call_conv_raw should be set.
                                         if (comp_inst_internal->resolved_imports[k].item.function) {
                                             WASMFunctionInstance *resolved_func = (WASMFunctionInstance *)comp_inst_internal->resolved_imports[k].item.function;
-                                            resolved_func_imports[current_func_import_k].is_native_func = resolved_func->is_native_func;
-                                            resolved_func_imports[current_func_import_k].call_conv_raw = resolved_func->call_conv_raw;
-                                            // Note: attachment and other fields might need to be copied if relevant for host funcs.
-                                        } else {
-                                            // Should not happen if kind matches and item is set. Defaulting defensively.
-                                            resolved_func_imports[current_func_import_k].is_native_func = false;
-                                            resolved_func_imports[current_func_import_k].call_conv_raw = false;
+                                        // Type check for functions
+                                        WASMFunctionInstance *resolved_func_inst = (WASMFunctionInstance *)comp_inst_internal->resolved_imports[k].item.function;
+                                        if (!resolved_func_inst) { /* Should not happen if kind matches */
+                                            set_comp_rt_error_v(error_buf, error_buf_size, "Internal error: Function import '%s' resolved item is NULL.", import_def->field_name);
+                                                import_resolution_failed = true; break;
+                                            }
+                                        // Get the WASMType* from the resolved function.
+                                        // For host functions, func_type_linked is usually set.
+                                        // For Wasm functions, it's also func_type_linked.
+                                        WASMType *resolved_type = resolved_func_inst->u.func.func_type_linked;
+                                        if (!resolved_type) { // Fallback for older host function style or if not populated
+                                             resolved_type = resolved_func_inst->type;
                                         }
+
+                                        if (!wasm_type_compatible(import_def->u.function.func_type, resolved_type)) {
+                                            set_comp_rt_error_v(error_buf, error_buf_size, "Function import '%s' (from component import) type signature mismatch.", import_def->field_name);
+                                                import_resolution_failed = true; break;
+                                            }
+
+                                        resolved_func_imports[current_func_import_k].module_name = (char*)import_def->module_name;
+                                        resolved_func_imports[current_func_import_k].field_name = (char*)import_def->field_name;
+                                        resolved_func_imports[current_func_import_k].func_ptr_linked = resolved_func_inst;
+                                        resolved_func_imports[current_func_import_k].signature = import_def->u.function.func_type;
+                                        resolved_func_imports[current_func_import_k].is_native_func = resolved_func_inst->is_native_func;
+                                        resolved_func_imports[current_func_import_k].call_conv_raw = resolved_func_inst->call_conv_raw;
                                         current_func_import_k++;
                                         break;
                                     case WASM_IMPORT_KIND_GLOBAL:
-                                        resolved_global_imports[current_global_import_k].module_name = (char*)import_def->module_name;
-                                        resolved_global_imports[current_global_import_k].field_name = (char*)import_def->field_name;
-                                        resolved_global_imports[current_global_import_k].global_ptr_linked = comp_inst_internal->resolved_imports[k].item.global;
-                                        // Type and mutability check for globals from component imports
-                                        if (comp_inst_internal->resolved_imports[k].item.global->type != import_def->u.global.type ||
-                                            comp_inst_internal->resolved_imports[k].item.global->is_mutable != import_def->u.global.is_mutable) {
-                                            set_comp_rt_error_v(error_buf, error_buf_size, "Global import '%s' (from component import) type or mutability mismatch.", import_def->field_name);
-                                            import_resolution_failed = true; break;
-                                        }
-                                        resolved_global_imports[current_global_import_k].is_linked = true;
-                                        current_global_import_k++;
-                                        break;
+                                        {
+                                            WASMGlobalInstance *resolved_global = comp_inst_internal->resolved_imports[k].item.global;
+                                            if (resolved_global->type != import_def->u.global.type) {
+                                                set_comp_rt_error_v(error_buf, error_buf_size, "Global import '%s' (from component import) type mismatch. Expected %d, got %d.",
+                                                                   import_def->field_name, import_def->u.global.type, resolved_global->type);
+                                                import_resolution_failed = true; break;
+                                            }
+                                            if (resolved_global->is_mutable != import_def->u.global.is_mutable) {
+                                                set_comp_rt_error_v(error_buf, error_buf_size, "Global import '%s' (from component import) mutability mismatch. Expected %d, got %d.",
+                                                                   import_def->field_name, import_def->u.global.is_mutable, resolved_global->is_mutable);
+                                                import_resolution_failed = true; break;
+                                            }
+                                            resolved_global_imports[current_global_import_k].module_name = (char*)import_def->module_name;
+                                            resolved_global_imports[current_global_import_k].field_name = (char*)import_def->field_name;
+                                            resolved_global_imports[current_global_import_k].global_ptr_linked = resolved_global;
+                                            resolved_global_imports[current_global_import_k].is_linked = true;
+                                            current_global_import_k++;
+                                            break;
+                                            }
                                     case WASM_IMPORT_KIND_TABLE:
-                                    {
-                                        WASMTableInstance *resolved_table = comp_inst_internal->resolved_imports[k].item.table;
-                                        if (import_def->u.table.elem_type != resolved_table->elem_type) {
-                                            set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) element type mismatch.", import_def->field_name);
-                                            import_resolution_failed = true; break;
-                                        }
-                                        if (resolved_table->init_size < import_def->u.table.init_size) {
-                                            set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) initial size too small.", import_def->field_name);
-                                            import_resolution_failed = true; break;
-                                        }
-                                        if (import_def->u.table.has_max_size) {
-                                            if (!resolved_table->has_max_size) {
-                                                set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) expects max size, but export has no max.", import_def->field_name);
+                                        {
+                                            WASMTableInstance *resolved_table = comp_inst_internal->resolved_imports[k].item.table;
+                                            // WASMImport *import_def has u.table which is WASMTableImport
+                                            // WASMTableImport has elem_type, init_size, max_size, has_max_size
+                                            if (import_def->u.table.elem_type != resolved_table->elem_type) {
+                                                set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) element type mismatch. Expected %d, got %d.",
+                                                                   import_def->field_name, import_def->u.table.elem_type, resolved_table->elem_type);
                                                 import_resolution_failed = true; break;
                                             }
-                                            if (resolved_table->max_size > import_def->u.table.max_size) {
-                                                set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) max size too large.", import_def->field_name);
+                                            if (resolved_table->init_size < import_def->u.table.init_size) {
+                                                set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) initial size too small. Expected >=%u, got %u.",
+                                                                   import_def->field_name, import_def->u.table.init_size, resolved_table->init_size);
                                                 import_resolution_failed = true; break;
                                             }
-                                        }
-                                        resolved_table_imports[current_table_import_k].module_name = (char*)import_def->module_name;
-                                        resolved_table_imports[current_table_import_k].field_name = (char*)import_def->field_name;
-                                        resolved_table_imports[current_table_import_k].table_inst_linked = resolved_table;
-                                        current_table_import_k++;
-                                        break;
-                                    }
+                                            if (import_def->u.table.has_max_size) {
+                                                if (!resolved_table->has_max_size) { // resolved_table->max_size == 0 means no max if has_max_size is false
+                                                    set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) expects max size, but export has no max.", import_def->field_name);
+                                                    import_resolution_failed = true; break;
+                                                }
+                                                if (resolved_table->max_size > import_def->u.table.max_size) {
+                                                    set_comp_rt_error_v(error_buf, error_buf_size, "Table import '%s' (from component import) max size too large. Expected <=%u, got %u.",
+                                                                       import_def->field_name, import_def->u.table.max_size, resolved_table->max_size);
+                                                    import_resolution_failed = true; break;
+                                                }
+                                            }
+                                            resolved_table_imports[current_table_import_k].module_name = (char*)import_def->module_name;
+                                            resolved_table_imports[current_table_import_k].field_name = (char*)import_def->field_name;
+                                            resolved_table_imports[current_table_import_k].table_inst_linked = resolved_table;
+                                            current_table_import_k++;
+                                            break;
+                                            }
                                     case WASM_IMPORT_KIND_MEMORY:
-                                    {
-                                        WASMMemoryInstance *resolved_memory = comp_inst_internal->resolved_imports[k].item.memory;
-                                        if (resolved_memory->init_page_count < import_def->u.memory.init_page_count) {
-                                            set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) initial pages too small.", import_def->field_name);
-                                            import_resolution_failed = true; break;
-                                        }
-                                        if (import_def->u.memory.has_max_size) {
-                                            if (resolved_memory->max_page_count == 0) { // max_page_count is 0 if no max
-                                                set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) expects max pages, but export has no max.", import_def->field_name);
+                                        {
+                                            WASMMemoryInstance *resolved_memory = comp_inst_internal->resolved_imports[k].item.memory;
+                                            // WASMImport *import_def has u.memory which is WASMMemoryImport
+                                            // WASMMemoryImport has init_page_count, max_page_count, has_max_size, is_shared
+                                            if (resolved_memory->init_page_count < import_def->u.memory.init_page_count) {
+                                                set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) initial pages too small. Expected >=%u, got %u.",
+                                                                   import_def->field_name, import_def->u.memory.init_page_count, resolved_memory->init_page_count);
                                                 import_resolution_failed = true; break;
                                             }
-                                            if (resolved_memory->max_page_count > import_def->u.memory.max_page_count) {
-                                                set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) max pages too large.", import_def->field_name);
+                                            if (import_def->u.memory.has_max_size) {
+                                                if (resolved_memory->max_page_count == 0) { // resolved_memory->max_page_count is 0 if no max for WASMMemoryInstance
+                                                    set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) expects max pages, but export has no max.", import_def->field_name);
+                                                    import_resolution_failed = true; break;
+                                                }
+                                                if (resolved_memory->max_page_count > import_def->u.memory.max_page_count) {
+                                                    set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) max pages too large. Expected <=%u, got %u.",
+                                                                       import_def->field_name, import_def->u.memory.max_page_count, resolved_memory->max_page_count);
+                                                    import_resolution_failed = true; break;
+                                                }
+                                            }
+                                            if (import_def->u.memory.is_shared != resolved_memory->is_shared) {
+                                                 set_comp_rt_error_v(error_buf, error_buf_size, "Memory import '%s' (from component import) shared flag mismatch. Expected %d, got %d.",
+                                                                   import_def->field_name, import_def->u.memory.is_shared, resolved_memory->is_shared);
                                                 import_resolution_failed = true; break;
                                             }
-                                        }
-                                        // TODO: Check shared memory flags if/when supported.
-                                        resolved_memory_imports[current_memory_import_k].module_name = (char*)import_def->module_name;
-                                        resolved_memory_imports[current_memory_import_k].field_name = (char*)import_def->field_name;
-                                        resolved_memory_imports[current_memory_import_k].memory_inst_linked = resolved_memory;
+                                            resolved_memory_imports[current_memory_import_k].module_name = (char*)import_def->module_name;
+                                            resolved_memory_imports[current_memory_import_k].field_name = (char*)import_def->field_name;
+                                            resolved_memory_imports[current_memory_import_k].memory_inst_linked = resolved_memory;
                                         current_memory_import_k++;
                                         break;
                                     }
@@ -1046,6 +1287,495 @@ wasm_component_instance_deinstantiate(WASMComponentInstanceInternal *comp_inst)
 
     bh_free(comp_inst);
 }
+
+// TODO: Implement this function
+static bool
+instance_type_compatible(WASMComponentInstanceType *expected_inst_type,
+                         WASMComponentInstanceInternal *actual_inst,
+                         WASMComponent *outer_component_def_context, /* For resolving type indexes in expected_inst_type */
+                         char *error_buf, uint32 error_buf_size)
+{
+    uint32 i;
+
+    if (!expected_inst_type) {
+        set_comp_rt_error(error_buf, error_buf_size, "Expected instance type is NULL.");
+        return false;
+    }
+    if (!actual_inst && expected_inst_type->decl_count > 0) {
+        set_comp_rt_error(error_buf, error_buf_size, "Actual instance is NULL but expected instance type is not empty.");
+        return false;
+    }
+    if (!actual_inst && expected_inst_type->decl_count == 0) {
+        return true; // Both are effectively empty/null
+    }
+    if (!actual_inst) { // Should have been caught by previous case if decl_count > 0
+        set_comp_rt_error(error_buf, error_buf_size, "Actual instance is NULL (unexpected).");
+        return false;
+    }
+
+
+    for (i = 0; i < expected_inst_type->decl_count; ++i) {
+        WASMComponentInstanceTypeDecl *decl = &expected_inst_type->decls[i];
+
+        if (decl->kind == INSTANCE_TYPE_DECL_KIND_EXPORT) {
+            WASMComponentTypeExportDecl *expected_export_decl = &decl->u.export_decl;
+            ResolvedComponentExportItem *actual_resolved_export = NULL;
+            uint32 j;
+
+            // Find export by name in actual_inst
+            for (j = 0; j < actual_inst->num_resolved_exports; ++j) {
+                if (strcmp(actual_inst->resolved_exports[j].name, expected_export_decl->name) == 0) {
+                    actual_resolved_export = &actual_inst->resolved_exports[j];
+                    break;
+                }
+            }
+
+            if (!actual_resolved_export) {
+                set_comp_rt_error_v(error_buf, error_buf_size,
+                                   "Expected export '%s' not found in actual instance.",
+                                   expected_export_decl->name);
+                return false;
+            }
+
+            // Check kind compatibility
+            // actual_resolved_export->kind is ResolvedComponentExportItemKind
+            // expected_export_decl->desc.kind is WASMComponentExternDescKind
+            bool kind_compatible = false;
+            switch (expected_export_decl->desc.kind) {
+                case EXTERN_DESC_KIND_FUNC:
+                    kind_compatible = (actual_resolved_export->kind == COMPONENT_EXPORT_KIND_FUNC);
+                    break;
+                case EXTERN_DESC_KIND_INSTANCE:
+                    kind_compatible = (actual_resolved_export->kind == COMPONENT_EXPORT_KIND_INSTANCE);
+                    break;
+                case EXTERN_DESC_KIND_COMPONENT:
+                    kind_compatible = (actual_resolved_export->kind == COMPONENT_EXPORT_KIND_COMPONENT);
+                    break;
+                case EXTERN_DESC_KIND_MODULE: // Core module
+                    kind_compatible = (actual_resolved_export->kind == COMPONENT_EXPORT_KIND_MODULE);
+                    break;
+                case EXTERN_DESC_KIND_VALUE: // Exported global/value
+                    kind_compatible = (actual_resolved_export->kind == COMPONENT_EXPORT_KIND_VALUE);
+                    break;
+                case EXTERN_DESC_KIND_TYPE:
+                    kind_compatible = (actual_resolved_export->kind == COMPONENT_EXPORT_KIND_TYPE);
+                    break;
+                default:
+                    kind_compatible = false;
+            }
+
+            if (!kind_compatible) {
+                set_comp_rt_error_v(error_buf, error_buf_size,
+                                   "Export '%s': kind mismatch. Expected extern_desc kind %u, actual export kind %u.",
+                                   expected_export_decl->name, expected_export_decl->desc.kind, actual_resolved_export->kind);
+                return false;
+            }
+
+            // Recursive type check based on kind
+            switch (expected_export_decl->desc.kind) {
+                case EXTERN_DESC_KIND_FUNC:
+                {
+                    if (expected_export_decl->desc.u.func_type_idx >= outer_component_def_context->type_definition_count ||
+                        outer_component_def_context->type_definitions[expected_export_decl->desc.u.func_type_idx].kind != DEF_TYPE_KIND_FUNC) {
+                        set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': expected func type index %u invalid.", expected_export_decl->name, expected_export_decl->desc.u.func_type_idx);
+                        return false;
+                    }
+                    WASMComponentFuncType *expected_func_type = &outer_component_def_context->type_definitions[expected_export_decl->desc.u.func_type_idx].u.func_type;
+                    LiftedFuncThunkContext *thunk_ctx = (LiftedFuncThunkContext*)actual_resolved_export->item.function_thunk_context;
+                    if (!thunk_ctx || !thunk_ctx->component_func_type) {
+                         set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': actual function thunk or its type info is missing.", expected_export_decl->name);
+                         return false;
+                    }
+                    WASMComponentFuncType *actual_func_type = thunk_ctx->component_func_type;
+                    // Actual defining component for the thunk's type is the actual_inst's component_def
+                    if (!component_func_type_compatible(expected_func_type, actual_func_type,
+                                                        outer_component_def_context, actual_inst->component_def,
+                                                        error_buf, error_buf_size)) {
+                        // error_buf should be set by component_func_type_compatible
+                        return false;
+                    }
+                    break;
+                }
+                case EXTERN_DESC_KIND_INSTANCE:
+                {
+                    if (expected_export_decl->desc.u.instance_type_idx >= outer_component_def_context->type_definition_count ||
+                        outer_component_def_context->type_definitions[expected_export_decl->desc.u.instance_type_idx].kind != DEF_TYPE_KIND_INSTANCE) {
+                        set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': expected instance type index %u invalid.", expected_export_decl->name, expected_export_decl->desc.u.instance_type_idx);
+                        return false;
+                    }
+                    WASMComponentInstanceType *expected_sub_inst_type = outer_component_def_context->type_definitions[expected_export_decl->desc.u.instance_type_idx].u.inst_type;
+                    WASMComponentInstanceInternal *actual_sub_inst = actual_resolved_export->item.component_instance;
+                    if (!instance_type_compatible(expected_sub_inst_type, actual_sub_inst,
+                                                  outer_component_def_context, /* Pass outer context for nested expected types */
+                                                  error_buf, error_buf_size)) {
+                        return false;
+                    }
+                    break;
+                }
+                case EXTERN_DESC_KIND_COMPONENT:
+                {
+                     if (expected_export_decl->desc.u.component_type_idx >= outer_component_def_context->type_definition_count ||
+                        outer_component_def_context->type_definitions[expected_export_decl->desc.u.component_type_idx].kind != DEF_TYPE_KIND_COMPONENT) {
+                        set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': expected component type index %u invalid.", expected_export_decl->name, expected_export_decl->desc.u.component_type_idx);
+                        return false;
+                    }
+                    WASMComponentComponentType *expected_sub_comp_type = outer_component_def_context->type_definitions[expected_export_decl->desc.u.component_type_idx].u.comp_type;
+                    WASMComponent *actual_sub_comp_def = actual_resolved_export->item.component_definition;
+                     if (!component_type_compatible(expected_sub_comp_type, actual_sub_comp_def,
+                                                   outer_component_def_context, /* Pass outer context for nested expected types */
+                                                   error_buf, error_buf_size)) {
+                        return false;
+                    }
+                    break;
+                }
+                case EXTERN_DESC_KIND_MODULE: // Core module
+                {
+                    // Ensure core_type_defs is used for core_module_type_idx
+                    if (expected_export_decl->desc.u.core_module_type_idx >= outer_component_def_context->core_type_count ||
+                        outer_component_def_context->core_types[expected_export_decl->desc.u.core_module_type_idx].kind != CORE_TYPE_KIND_MODULE_OBSOLETE) { // Assuming CORE_TYPE_KIND_MODULE_OBSOLETE or similar for module types in core_types
+                        set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': expected core module type index %u invalid or not a module type.", expected_export_decl->name, expected_export_decl->desc.u.core_module_type_idx);
+                        // LOG_TODO: Fix kind check once CORE_TYPE_KIND_MODULE is finalized for core_types section
+                        // return false; // Temporarily allow to pass if CORE_TYPE_KIND_MODULE_OBSOLETE is not used
+                    }
+                    // WASMComponentCoreModuleType *expected_core_mod_type = &outer_component_def_context->core_types[expected_export_decl->desc.u.core_module_type_idx].u.core_type_def.module_type; // If structure was different
+                    // This needs to align with how core module types are stored and retrieved.
+                    // For now, assuming it's not DEF_TYPE_KIND_CORE_MODULE from type_definitions, but a core_type.
+                    LOG_TODO("Export '%s': core_module_type_compatible needs to be called. Type resolution path for expected core module type needs confirmation.", expected_export_decl->name);
+                    // WASMModuleInstance *actual_core_mod_inst = actual_resolved_export->item.module_instance;
+                    // if (!core_module_type_compatible(expected_core_mod_type, actual_core_mod_inst, outer_component_def_context, error_buf, error_buf_size)) {
+                    //    return false;
+                    // }
+                    break;
+                }
+                case EXTERN_DESC_KIND_VALUE: // Exported global/value
+                {
+                    // expected_export_decl->desc.u.value_type is WASMComponentValType*
+                    WASMComponentValType *expected_val_type = expected_export_decl->desc.u.value_type;
+                    WASMGlobalInstance *actual_global = actual_resolved_export->item.global;
+                    if (!core_global_type_compatible_with_component_val_type(expected_val_type, actual_global,
+                                                                            outer_component_def_context,
+                                                                            error_buf, error_buf_size)) {
+                        return false;
+                    }
+                    break;
+                }
+                case EXTERN_DESC_KIND_TYPE:
+                {
+                    LOG_TODO("Type compatibility for EXTERN_DESC_KIND_TYPE (exported types with bounds) in instance_type_compatible not fully implemented.");
+                    // WASMComponentTypeBound *expected_type_bound = &expected_export_decl->desc.u.type_bound;
+                    // WASMComponentDefinedType *actual_type_def = actual_resolved_export->item.type_definition;
+                    // Implement type bound checking logic here.
+                    break;
+                }
+                default:
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Unhandled extern_desc kind %u for compatibility check.",
+                                       expected_export_decl->name, expected_export_decl->desc.kind);
+                    return false;
+            }
+        }
+        // TODO: Handle other decl kinds if necessary (e.g. aliases, types defined within instance type)
+        // For now, only exports are checked for subtype compatibility as per typical instance subtyping.
+    }
+
+    return true;
+}
+
+// Helper for component_type_compatible
+static bool
+extern_desc_compatible(WASMComponentExternDesc *expected_desc,
+                       WASMComponentExternDesc *actual_desc,
+                       WASMComponent *context_for_expected,
+                       WASMComponent *context_for_actual,
+                       char *error_buf, uint32 error_buf_size)
+{
+    if (expected_desc->kind != actual_desc->kind) {
+        set_comp_rt_error_v(error_buf, error_buf_size,
+                           "Extern description kind mismatch. Expected %d, actual %d.",
+                           expected_desc->kind, actual_desc->kind);
+        return false;
+    }
+
+    switch (expected_desc->kind) {
+        case EXTERN_DESC_KIND_FUNC:
+        {
+            if (expected_desc->u.func_type_idx >= context_for_expected->type_definition_count
+                || context_for_expected->type_definitions[expected_desc->u.func_type_idx].kind != DEF_TYPE_KIND_FUNC) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid expected function type index.");
+                return false;
+            }
+            WASMComponentFuncType *expected_ft = &context_for_expected->type_definitions[expected_desc->u.func_type_idx].u.func_type;
+
+            if (actual_desc->u.func_type_idx >= context_for_actual->type_definition_count
+                || context_for_actual->type_definitions[actual_desc->u.func_type_idx].kind != DEF_TYPE_KIND_FUNC) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid actual function type index.");
+                return false;
+            }
+            WASMComponentFuncType *actual_ft = &context_for_actual->type_definitions[actual_desc->u.func_type_idx].u.func_type;
+            return component_func_type_compatible(expected_ft, actual_ft, context_for_expected, context_for_actual, error_buf, error_buf_size);
+        }
+        case EXTERN_DESC_KIND_INSTANCE:
+        {
+            if (expected_desc->u.instance_type_idx >= context_for_expected->type_definition_count
+                || context_for_expected->type_definitions[expected_desc->u.instance_type_idx].kind != DEF_TYPE_KIND_INSTANCE) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid expected instance type index.");
+                return false;
+            }
+            WASMComponentInstanceType *expected_it = context_for_expected->type_definitions[expected_desc->u.instance_type_idx].u.inst_type;
+
+            if (actual_desc->u.instance_type_idx >= context_for_actual->type_definition_count
+                || context_for_actual->type_definitions[actual_desc->u.instance_type_idx].kind != DEF_TYPE_KIND_INSTANCE) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid actual instance type index.");
+                return false;
+            }
+            // instance_type_compatible expects WASMComponentInstanceInternal for actual, not WASMComponentInstanceType.
+            // This helper is for comparing type definitions, not runtime instances.
+            // This implies a different version of instance_type_compatible for definition-time checks,
+            // or this path is invalid for definition-time extern_desc comparison.
+            LOG_TODO("EXTERN_DESC_KIND_INSTANCE compatibility check needs instance_type_definition_compatible().");
+            // For now, assume instance_type_compatible can somehow work or this is a TODO.
+            // WASMComponentInstanceType *actual_it = context_for_actual->type_definitions[actual_desc->u.instance_type_idx].u.inst_type;
+            // return instance_type_compatible(expected_it, actual_it /* This is wrong */, context_for_expected, error_buf, error_buf_size);
+            return true; // Placeholder
+        }
+        case EXTERN_DESC_KIND_COMPONENT:
+        {
+            if (expected_desc->u.component_type_idx >= context_for_expected->type_definition_count
+                || context_for_expected->type_definitions[expected_desc->u.component_type_idx].kind != DEF_TYPE_KIND_COMPONENT) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid expected component type index.");
+                return false;
+            }
+            WASMComponentComponentType *expected_ct = context_for_expected->type_definitions[expected_desc->u.component_type_idx].u.comp_type;
+
+            if (actual_desc->u.component_type_idx >= context_for_actual->type_definition_count
+                || context_for_actual->type_definitions[actual_desc->u.component_type_idx].kind != DEF_TYPE_KIND_COMPONENT) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid actual component type index.");
+                return false;
+            }
+            // component_type_compatible expects WASMComponent for actual, not WASMComponentComponentType.
+            // This implies a different version of component_type_compatible for definition-time checks.
+            LOG_TODO("EXTERN_DESC_KIND_COMPONENT compatibility check needs component_type_definition_compatible().");
+            // WASMComponentComponentType *actual_ct = context_for_actual->type_definitions[actual_desc->u.component_type_idx].u.comp_type;
+            // return component_type_compatible(expected_ct, actual_ct /* This is wrong */, context_for_expected, error_buf, error_buf_size);
+            return true; // Placeholder
+        }
+        case EXTERN_DESC_KIND_MODULE: // Core Module
+        {
+            // Expected type from context_for_expected->core_types
+            if (expected_desc->u.core_module_type_idx >= context_for_expected->core_type_count
+                || context_for_expected->core_types[expected_desc->u.core_module_type_idx].kind != CORE_TYPE_KIND_MODULE_OBSOLETE /* Placeholder kind */) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid expected core module type index or kind.");
+                return false;
+            }
+            // WASMComponentCoreModuleType *expected_cmt = &context_for_expected->core_types[expected_desc->u.core_module_type_idx].u.core_type_def.module_type; // If using new structure
+
+            // Actual type from context_for_actual->core_types
+            if (actual_desc->u.core_module_type_idx >= context_for_actual->core_type_count
+                || context_for_actual->core_types[actual_desc->u.core_module_type_idx].kind != CORE_TYPE_KIND_MODULE_OBSOLETE /* Placeholder kind */) {
+                set_comp_rt_error(error_buf, error_buf_size, "Invalid actual core module type index or kind.");
+                return false;
+            }
+            // WASMComponentCoreModuleType *actual_cmt = &context_for_actual->core_types[actual_desc->u.core_module_type_idx].u.core_type_def.module_type;
+            LOG_TODO("EXTERN_DESC_KIND_MODULE compatibility using core_module_type_compatible (needs review of type storage).");
+            // return core_module_type_compatible(expected_cmt, actual_cmt, error_buf, error_buf_size);
+            return true; // Placeholder
+        }
+        case EXTERN_DESC_KIND_VALUE:
+            // If WASMComponentExternDesc.u.value_type is WASMComponentValType (direct struct)
+            return component_val_type_compatible(&expected_desc->u.value_type, &actual_desc->u.value_type,
+                                               context_for_expected, context_for_actual, error_buf, error_buf_size);
+        }
+        case EXTERN_DESC_KIND_TYPE:
+            LOG_TODO("Type bound compatibility for EXTERN_DESC_KIND_TYPE not fully implemented in extern_desc_compatible.");
+            if (expected_desc->u.type_bound.kind == TYPE_BOUND_KIND_EQ && actual_desc->u.type_bound.kind == TYPE_BOUND_KIND_EQ) {
+                // This is a very simplistic check. Type equality usually means structural equivalence,
+                // or if they point to the same type definition *in the same component definition context*.
+                // Here we only have indices, so they must be in the same context for direct index comparison.
+                // If contexts are different, this is insufficient.
+                if (context_for_expected == context_for_actual) {
+                    if (expected_desc->u.type_bound.type_idx == actual_desc->u.type_bound.type_idx) {
+                        return true;
+                    }
+                }
+                // Fallback to structural check or error if contexts differ / more complex bound.
+                set_comp_rt_error(error_buf, error_buf_size, "Type bound compatibility for EQ across different contexts or non-EQ bounds not yet fully supported.");
+                return false; // Or true if we want to be lenient for now.
+            }
+            return false; // Different bound kinds or unhandled
+        default:
+            set_comp_rt_error_v(error_buf, error_buf_size, "Unknown extern description kind %d for compatibility check.", expected_desc->kind);
+            return false;
+    }
+    // Should be unreachable if all cases return
+    return false;
+}
+
+static bool
+component_type_compatible(WASMComponentComponentType *expected_comp_type,
+                          WASMComponent *actual_comp_def,
+                          WASMComponent *defining_context_for_expected_type, /* Component that defines expected_comp_type */
+                          char* error_buf, uint32 error_buf_size)
+{
+    uint32 i, j;
+
+    if (!expected_comp_type) {
+        set_comp_rt_error(error_buf, error_buf_size, "Expected component type is NULL.");
+        return false;
+    }
+    if (!actual_comp_def) {
+        set_comp_rt_error(error_buf, error_buf_size, "Actual component definition is NULL.");
+        return false;
+    }
+
+    // Check imports
+    for (i = 0; i < expected_comp_type->decl_count; ++i) {
+        if (expected_comp_type->decls[i].kind == COMPONENT_TYPE_DECL_KIND_IMPORT) {
+            WASMComponentTypeImportDecl *expected_import_decl = &expected_comp_type->decls[i].u.import_decl;
+            WASMComponentImport *actual_import_def = NULL;
+
+            for (j = 0; j < actual_comp_def->import_count; ++j) {
+                if (strcmp(actual_comp_def->imports[j].name, expected_import_decl->name) == 0) {
+                    actual_import_def = &actual_comp_def->imports[j];
+                    break;
+                }
+            }
+
+            if (!actual_import_def) {
+                set_comp_rt_error_v(error_buf, error_buf_size,
+                                   "Expected import '%s' not found in actual component definition.",
+                                   expected_import_decl->name);
+                return false;
+            }
+
+            // Compare descriptions
+            if (!extern_desc_compatible(&expected_import_decl->desc, &actual_import_def->desc,
+                                        defining_context_for_expected_type, actual_comp_def, /* actual_comp_def is context for its own imports */
+                                        error_buf, error_buf_size)) {
+                // error_buf should be set by extern_desc_compatible
+                return false;
+            }
+        }
+    }
+
+    // Check exports
+    for (i = 0; i < expected_comp_type->decl_count; ++i) {
+        if (expected_comp_type->decls[i].kind == COMPONENT_TYPE_DECL_KIND_EXPORT) {
+            WASMComponentTypeExportDecl *expected_export_decl = &expected_comp_type->decls[i].u.export_decl;
+            WASMComponentExport *actual_export_def = NULL;
+
+            for (j = 0; j < actual_comp_def->export_count; ++j) {
+                if (strcmp(actual_comp_def->exports[j].name, expected_export_decl->name) == 0) {
+                    actual_export_def = &actual_comp_def->exports[j];
+                    break;
+                }
+            }
+
+            if (!actual_export_def) {
+                set_comp_rt_error_v(error_buf, error_buf_size,
+                                   "Expected export '%s' not found in actual component definition.",
+                                   expected_export_decl->name);
+                return false;
+            }
+
+            // Basic kind check (e.g. EXPORT_KIND_FUNC vs EXTERN_DESC_KIND_FUNC)
+            bool kind_match = false;
+            switch(expected_export_decl->desc.kind) {
+                case EXTERN_DESC_KIND_FUNC: kind_match = (actual_export_def->kind == EXPORT_KIND_FUNC); break;
+                case EXTERN_DESC_KIND_VALUE: kind_match = (actual_export_def->kind == EXPORT_KIND_VALUE); break;
+                case EXTERN_DESC_KIND_TYPE: kind_match = (actual_export_def->kind == EXPORT_KIND_TYPE); break;
+                case EXTERN_DESC_KIND_COMPONENT: kind_match = (actual_export_def->kind == EXPORT_KIND_COMPONENT); break;
+                case EXTERN_DESC_KIND_INSTANCE: kind_match = (actual_export_def->kind == EXPORT_KIND_INSTANCE); break;
+                // EXTERN_DESC_KIND_MODULE is not directly exportable from a component, but from a core instance.
+                default: kind_match = false;
+            }
+            if (!kind_match) {
+                 set_comp_rt_error_v(error_buf, error_buf_size,
+                                   "Export '%s' kind mismatch. Expected desc kind %d, actual export kind %d.",
+                                   expected_export_decl->name, expected_export_decl->desc.kind, actual_export_def->kind);
+                return false;
+            }
+
+            // For detailed type checking, we need to resolve the actual export's type.
+            // actual_export_def->optional_desc_type_idx points to a WASMComponentDefinedType in actual_comp_def.
+            // We need to construct a temporary WASMComponentExternDesc from this to use extern_desc_compatible,
+            // or adapt extern_desc_compatible, or do direct specific checks.
+            // Baseline: If actual_export_def->optional_desc_type_idx is valid, use it.
+            if (actual_export_def->optional_desc_type_idx != (uint32)-1) {
+                if (actual_export_def->optional_desc_type_idx >= actual_comp_def->type_definition_count) {
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': actual export's type annotation index %u is out of bounds.",
+                                       actual_export_def->name, actual_export_def->optional_desc_type_idx);
+                    return false;
+                }
+                WASMComponentDefinedType *actual_export_type_def = &actual_comp_def->type_definitions[actual_export_def->optional_desc_type_idx];
+
+                // Now, compare expected_export_decl->desc with actual_export_type_def.
+                // This requires a new helper or enhancing extern_desc_compatible.
+                // e.g., extern_desc_compatible_with_defined_type(expected_desc, actual_defined_type, ...)
+                LOG_TODO("Detailed type check for export '%s' using its optional_desc_type_idx.", actual_export_def->name);
+
+                // Simplified check for now: if expected is func, actual type def must be func, then compare func types.
+                if (expected_export_decl->desc.kind == EXTERN_DESC_KIND_FUNC) {
+                    if (actual_export_type_def->kind != DEF_TYPE_KIND_FUNC) {
+                        set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': type kind mismatch. Expected func, actual def kind %d.", actual_export_def->name, actual_export_type_def->kind);
+                        return false;
+                    }
+                    // Resolve expected func type
+                     if (expected_export_decl->desc.u.func_type_idx >= defining_context_for_expected_type->type_definition_count
+                         || defining_context_for_expected_type->type_definitions[expected_export_decl->desc.u.func_type_idx].kind != DEF_TYPE_KIND_FUNC) {
+                         set_comp_rt_error(error_buf, error_buf_size, "Invalid expected function type index for export.");
+                         return false;
+                     }
+                    WASMComponentFuncType *expected_ft = &defining_context_for_expected_type->type_definitions[expected_export_decl->desc.u.func_type_idx].u.func_type;
+                    WASMComponentFuncType *actual_ft = &actual_export_type_def->u.func_type;
+                    if (!component_func_type_compatible(expected_ft, actual_ft, defining_context_for_expected_type, actual_comp_def, error_buf, error_buf_size)) {
+                        return false;
+                    }
+                }
+                // Add similar blocks for other kinds (INSTANCE, COMPONENT, VALUE, TYPE)
+            } else {
+                // Actual export has no explicit type annotation. Subtyping might be more lenient or based on inference.
+                // For a baseline, if expected has a specific type, this might be an incompatibility.
+                // However, if expected_export_decl->desc is just a kind check without a specific type_idx, it might pass.
+                LOG_TODO("Export '%s': Actual export has no type annotation. Compatibility check needs refinement.", actual_export_def->name);
+            }
+        }
+    }
+    return true;
+}
+
+// TODO: Implement this function
+static bool
+component_func_type_compatible(WASMComponentFuncType *expected_func_type,
+                               WASMComponentFuncType *actual_func_type,
+                               WASMComponent *expected_defining_component, /* Component that defines expected_func_type */
+                               WASMComponent *actual_defining_component,   /* Component that defines actual_func_type */
+                               char* error_buf, uint32 error_buf_size)
+{
+    LOG_TODO("component_func_type_compatible: Detailed check of params/results needed, including valtype_compatible calls.");
+    return true;
+}
+
+// TODO: Implement this function
+static bool
+core_func_type_compatible_with_component_func_type(WASMType *expected_core_func_type,
+                                                   WASMComponentFuncType *actual_comp_func_type,
+                                                   WASMComponent *actual_defining_component, /* Component that defines actual_comp_func_type */
+                                                   char* error_buf, uint32 error_buf_size)
+{
+    LOG_TODO("core_func_type_compatible_with_component_func_type: Detailed check needed.");
+    return true;
+}
+
+// TODO: Implement this function
+static bool
+core_global_type_compatible_with_component_val_type(WASMComponentValType *expected_val_type, /* Defined in expected_defining_component */
+                                                    WASMGlobalInstance *actual_core_global,
+                                                    WASMComponent *expected_defining_component,
+                                                    char* error_buf, uint32 error_buf_size)
+{
+    LOG_TODO("core_global_type_compatible_with_component_val_type: Detailed check needed.");
+    return true;
+}
+
 // Placeholder for LiftedFuncThunk and create_lifted_function_thunk
 // These would typically be in wasm_component_canonical.h/c or similar.
 typedef struct LiftedFuncThunkContext {
@@ -1359,68 +2089,92 @@ execute_component_start_function(WASMComponentInstanceInternal *comp_inst,
     }
 
     // 2. Resolve Arguments:
-    if (start_def->arg_count > 0) {
-        // TODO: Resolve `start_def->arg_value_indices[i]` to runtime component values.
-        // This requires Value Section (ID 12) parsing and storage.
-        LOG_TODO("Start function argument resolution requires Value Section implementation.");
-        set_comp_rt_error(error_buf, error_buf_size, "Start function arguments not yet supported (requires Value Section).");
+    void **component_argv = NULL;
+    if (start_def->arg_count != func_type->param_count) {
+        set_comp_rt_error_v(error_buf, error_buf_size,
+                           "Start function '%s' argument count mismatch. Definition has %u, function type expects %u.",
+                           target_export_func->name, start_def->arg_count, func_type->param_count);
         return false;
     }
-    // If arg_count == 0, no arguments to resolve.
+
+    if (start_def->arg_count > 0) {
+        uint32 i;
+        component_argv = bh_malloc(start_def->arg_count * sizeof(void*));
+        if (!component_argv) {
+            set_comp_rt_error(error_buf, error_buf_size, "Memory allocation failed for start function arguments.");
+            return false;
+        }
+        memset(component_argv, 0, start_def->arg_count * sizeof(void*));
+
+        for (i = 0; i < start_def->arg_count; ++i) {
+            uint32 value_idx = start_def->arg_value_indices[i];
+            if (value_idx >= comp_inst->component_def->value_count) {
+                set_comp_rt_error_v(error_buf, error_buf_size,
+                                   "Start function '%s' argument %d: value_idx %u out of bounds for component values (count %u).",
+                                   target_export_func->name, i, value_idx, comp_inst->component_def->value_count);
+                bh_free(component_argv);
+                return false;
+            }
+            WASMComponentValue *source_comp_value = &comp_inst->component_def->values[value_idx];
+            WASMComponentValType *expected_arg_type = func_type->params[i].valtype; // Assuming params is an array of LabelValType
+
+            if (!component_val_type_compatible(expected_arg_type, &source_comp_value->parsed_type,
+                                               comp_inst->component_def, /* context for expected (func params are defined in this component) */
+                                               comp_inst->component_def, /* context for actual (values are defined in this component) */
+                                               error_buf, error_buf_size)) {
+                // Prepend argument index to error message if not already specific enough
+                // For now, component_val_type_compatible should set a good error.
+                bh_free(component_argv);
+                return false;
+            }
+            component_argv[i] = (void*)&source_comp_value->val;
+        }
+    }
 
     // 3. Invoke Function:
-    LOG_VERBOSE("Executing component start function '%s'.", target_export_func->name);
+    LOG_VERBOSE("Executing component start function '%s' with %u arguments.", target_export_func->name, start_def->arg_count);
 
-    // The actual C function pointer is stored in the thunk context.
-    // Its signature must match the conventions (e.g., taking ExecEnv and then args).
-    // For a start function with no args and no results: void (*actual_c_thunk_ptr)(WASMExecEnv*).
-    if (!thunk_ctx->host_callable_c_function_ptr) {
+    if (!thunk_ctx->host_callable_c_function_ptr) { // Should be generic_thunk_executor_ptr or similar
          set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' thunk context is missing the callable C function pointer.", target_export_func->name);
+         if (component_argv) bh_free(component_argv);
          return false;
     }
 
-    // Assuming parent_exec_env is the correct one for running component-level functions.
-    // Or comp_inst should have its own dedicated exec_env for its thunks.
     WASMExecEnv *exec_env_for_thunk = thunk_ctx->parent_comp_exec_env; 
-    if (!exec_env_for_thunk) { // Fallback or error
-        exec_env_for_thunk = comp_inst->exec_env; // Assuming comp_inst has one.
+    if (!exec_env_for_thunk) { 
+        exec_env_for_thunk = comp_inst->exec_env; 
         if (!exec_env_for_thunk) {
              set_comp_rt_error_v(error_buf, error_buf_size, "No valid WASMExecEnv found for executing start function '%s'.", target_export_func->name);
+             if (component_argv) bh_free(component_argv);
              return false;
         }
     }
     
-    // Assuming a function with signature: void func(WASMExecEnv *exec_env, LiftedFuncThunkContext *thunk_ctx_for_args_if_any)
-    // For no args:
-    typedef void (*start_func_no_args_t)(WASMExecEnv*, LiftedFuncThunkContext*);
-    // The generic thunk invoker would handle the actual call to core wasm after lowering args from context.
-    // For now, direct call if we assume the host_callable_c_function_ptr is exactly what we need.
-    // This is a simplification of the thunk invocation logic from Step 5.
-    // The actual signature of host_callable_c_function_ptr depends on how it's generated.
-    // Let's assume it's: void (*actual_thunk_code)(LiftedFuncThunkContext* actual_ctx, /* component args directly ... */);
-    // And for a no-arg start function, it's: void (*actual_thunk_code)(LiftedFuncThunkContext* actual_ctx);
+    // Assuming the generic thunk executor has a signature like:
+    // bool generic_thunk_executor(WASMExecEnv *exec_env, LiftedFuncThunkContext *thunk_context, 
+    //                             uint32 argc, void **argv, void **results_ptr_array);
+    // And it returns true on success, false on trap/exception (setting error_buf).
+    // The host_callable_c_function_ptr in thunk_ctx should point to such a generic executor.
+    typedef bool (*generic_thunk_executor_t)(WASMExecEnv*, LiftedFuncThunkContext*, uint32, void**, void**);
+    generic_thunk_executor_t executor = (generic_thunk_executor_t)thunk_ctx->host_callable_c_function_ptr;
 
-    // This is a placeholder for the actual thunk invocation mechanism
-    LOG_TODO("Actual invocation of start function thunk '%s' needs to align with Step 5 thunk design.", target_export_func->name);
-    // For now, we cannot directly call `thunk_ctx->host_callable_c_function_ptr` without knowing its exact signature
-    // and how it expects its context versus component arguments.
-    // The current placeholder `create_lifted_function_thunk` also sets an error, so this path won't be fully testable yet.
-    if (strcmp(error_buf, "Lifted function thunk creation is a placeholder.") == 0) {
-        // If the thunk is just a placeholder, we can't execute it.
-        // Silently pass for now if this specific error is present, to allow testing other parts.
-        LOG_WARNING("Start function '%s' not executed because its thunk is a placeholder.", target_export_func->name);
-        // Clear the placeholder error to not fail instantiation if this is the only "issue".
-        if(error_buf_size > 0) error_buf[0] = '\0'; 
-    } else {
-        // If it were a real thunk, we'd call it.
-        // Example: ((void (*)(WASMExecEnv*, LiftedFuncThunkContext*))thunk_ctx->host_callable_c_function_ptr)(exec_env_for_thunk, thunk_ctx);
-        // And then check for exceptions.
-        set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' invocation logic is incomplete.", target_export_func->name);
-        return false; // Cannot proceed with actual call yet.
+    // For start function, results_ptr_array is NULL.
+    bool success = executor(exec_env_for_thunk, thunk_ctx, start_def->arg_count, component_argv, NULL);
+
+    if (component_argv) {
+        bh_free(component_argv);
     }
 
-
-    // Check for exceptions if the call were made
+    if (!success) {
+        // error_buf should have been set by the executor or by canonical ABI functions it called.
+        // If not, set a generic one.
+        if (error_buf[0] == '\0') {
+             set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' execution failed or trapped.", target_export_func->name);
+        }
+        return false;
+    }
+    
+    // Check for exceptions if the call were made (already handled by generic_thunk_executor ideally)
     // WASMModuleInstance *exception_module_inst = wasm_runtime_get_module_inst(exec_env_for_thunk); // Which module instance to check?
     // if (exception_module_inst && wasm_runtime_get_exception(exception_module_inst)) {
     //     set_comp_rt_error_v(error_buf, error_buf_size, "Exception occurred during start function '%s': %s",

@@ -12,6 +12,243 @@
 #include "wasm_loader_common.h" /* For loader_malloc, loader_free */
 #include <string.h> // For memset
 
+// Forward declaration for recursive lifting (if complex types like lists of lists are handled)
+static bool wasm_component_canon_lift_value_internal(WASMExecEnv *exec_env, WASMComponentInstanceInternal *comp_inst,
+                                           WASMComponentCanonical *canonical_def,
+                                           WASMComponentValType *target_component_valtype,
+                                           void *core_value_ptr, /* Pointer to core Wasm value(s) on stack or in memory */
+                                           void **lifted_component_value_ptr, /* Output: pointer to the lifted component value */
+                                           char *error_buf, uint32 error_buf_size);
+
+
+/* Helper for UTF-8 to UTF-16 transcoding */
+static bool
+utf8_to_utf16(const char* utf8_str, uint32_t utf8_len_bytes,
+              uint16_t** out_utf16_buf, uint32_t* out_utf16_code_units,
+              char *error_buf, uint32 error_buf_size)
+{
+    uint32_t utf16_len = 0;
+    uint32_t i = 0;
+
+    if (!error_buf || error_buf_size == 0) return false;
+    if (!utf8_str || !out_utf16_buf || !out_utf16_code_units) {
+        set_canon_error(error_buf, error_buf_size, "utf8_to_utf16: Null arguments.");
+        return false;
+    }
+
+    *out_utf16_buf = NULL;
+    *out_utf16_code_units = 0;
+
+    if (utf8_len_bytes == 0) {
+        return true;
+    }
+
+    // Pass 1: Calculate required UTF-16 code units
+    while (i < utf8_len_bytes) {
+        uint32_t scalar_value;
+        uint8_t c = utf8_str[i];
+        uint32_t char_len;
+
+        if (c < 0x80) { // 1-byte sequence (ASCII)
+            scalar_value = c;
+            char_len = 1;
+        } else if ((c & 0xE0) == 0xC0) { // 2-byte sequence
+            if (i + 1 >= utf8_len_bytes || (utf8_str[i+1] & 0xC0) != 0x80) { goto invalid_utf8; }
+            scalar_value = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(utf8_str[i+1] & 0x3F);
+            char_len = 2;
+        } else if ((c & 0xF0) == 0xE0) { // 3-byte sequence
+            if (i + 2 >= utf8_len_bytes || (utf8_str[i+1] & 0xC0) != 0x80 || (utf8_str[i+2] & 0xC0) != 0x80) { goto invalid_utf8; }
+            scalar_value = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(utf8_str[i+1] & 0x3F) << 6) | (uint32_t)(utf8_str[i+2] & 0x3F);
+            char_len = 3;
+        } else if ((c & 0xF8) == 0xF0) { // 4-byte sequence
+            if (i + 3 >= utf8_len_bytes || (utf8_str[i+1] & 0xC0) != 0x80 || (utf8_str[i+2] & 0xC0) != 0x80 || (utf8_str[i+3] & 0xC0) != 0x80) { goto invalid_utf8; }
+            scalar_value = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(utf8_str[i+1] & 0x3F) << 12) | ((uint32_t)(utf8_str[i+2] & 0x3F) << 6) | (uint32_t)(utf8_str[i+3] & 0x3F);
+            char_len = 4;
+        } else {
+            goto invalid_utf8;
+        }
+
+        if (scalar_value <= 0xFFFF) {
+            utf16_len++;
+        } else if (scalar_value <= 0x10FFFF) {
+            utf16_len += 2; // Surrogate pair
+        } else {
+            goto invalid_utf8; // Invalid scalar value
+        }
+        i += char_len;
+    }
+
+    if (utf16_len == 0 && utf8_len_bytes > 0) { // Should have been caught by invalid_utf8 if length > 0
+        goto invalid_utf8;
+    }
+    if (utf16_len == 0) { // Valid empty or all invalid sequence that resulted in 0 len
+         return true; // Already set *out_utf16_buf = NULL, *out_utf16_code_units = 0;
+    }
+
+
+    *out_utf16_buf = bh_malloc(utf16_len * sizeof(uint16_t));
+    if (!*out_utf16_buf) {
+        set_canon_error(error_buf, error_buf_size, "Memory allocation failed for UTF-16 buffer.");
+        return false;
+    }
+
+    // Pass 2: Transcode
+    i = 0;
+    uint32_t utf16_idx = 0;
+    while (i < utf8_len_bytes) {
+        uint32_t scalar_value;
+        uint8_t c = utf8_str[i];
+        uint32_t char_len;
+
+        if (c < 0x80) {
+            scalar_value = c; char_len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            scalar_value = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(utf8_str[i+1] & 0x3F); char_len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            scalar_value = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(utf8_str[i+1] & 0x3F) << 6) | (uint32_t)(utf8_str[i+2] & 0x3F); char_len = 3;
+        } else { // 0xF0
+            scalar_value = ((uint32_t)(c & 0x07) << 18) | ((uint32_t)(utf8_str[i+1] & 0x3F) << 12) | ((uint32_t)(utf8_str[i+2] & 0x3F) << 6) | (uint32_t)(utf8_str[i+3] & 0x3F); char_len = 4;
+        }
+
+        if (scalar_value <= 0xFFFF) {
+            (*out_utf16_buf)[utf16_idx++] = (uint16_t)scalar_value;
+        } else {
+            scalar_value -= 0x10000;
+            (*out_utf16_buf)[utf16_idx++] = (uint16_t)((scalar_value >> 10) + 0xD800);
+            (*out_utf16_buf)[utf16_idx++] = (uint16_t)((scalar_value & 0x03FF) + 0xDC00);
+        }
+        i += char_len;
+    }
+    *out_utf16_code_units = utf16_len;
+    return true;
+
+invalid_utf8:
+    set_canon_error(error_buf, error_buf_size, "Invalid UTF-8 sequence encountered during transcoding.");
+    if (*out_utf16_buf) { // Should not happen if error before allocation
+        bh_free(*out_utf16_buf);
+        *out_utf16_buf = NULL;
+    }
+    *out_utf16_code_units = 0;
+    return false;
+}
+
+/* Helper for UTF-16 to UTF-8 transcoding */
+static bool
+utf16_to_utf8(const uint16_t* utf16_buf, uint32_t utf16_code_units,
+              char** out_utf8_str, uint32_t* out_utf8_len_bytes,
+              char *error_buf, uint32 error_buf_size)
+{
+    uint32_t utf8_len = 0;
+    uint32_t i = 0;
+
+    if (!error_buf || error_buf_size == 0) return false;
+    if (!utf16_buf || !out_utf8_str || !out_utf8_len_bytes) {
+        set_canon_error(error_buf, error_buf_size, "utf16_to_utf8: Null arguments.");
+        return false;
+    }
+    
+    *out_utf8_str = NULL;
+    *out_utf8_len_bytes = 0;
+
+    if (utf16_code_units == 0) {
+        // Allocate and return an empty, null-terminated string
+        *out_utf8_str = bh_malloc(1);
+        if (!*out_utf8_str) {
+            set_canon_error(error_buf, error_buf_size, "Memory allocation failed for empty UTF-8 string.");
+            return false;
+        }
+        (*out_utf8_str)[0] = '\0';
+        return true;
+    }
+
+    // Pass 1: Calculate required UTF-8 bytes
+    for (i = 0; i < utf16_code_units; ++i) {
+        uint16_t W1 = utf16_buf[i];
+        uint32_t scalar_value;
+
+        if (W1 >= 0xD800 && W1 <= 0xDBFF) { // High surrogate
+            if (i + 1 < utf16_code_units) {
+                uint16_t W2 = utf16_buf[i+1];
+                if (W2 >= 0xDC00 && W2 <= 0xDFFF) { // Low surrogate
+                    scalar_value = 0x10000 + ((uint32_t)(W1 - 0xD800) << 10) + (uint32_t)(W2 - 0xDC00);
+                    i++; // Consume low surrogate as well
+                } else { goto invalid_utf16; }
+            } else { goto invalid_utf16; }
+        } else if (W1 >= 0xDC00 && W1 <= 0xDFFF) { // Unmatched low surrogate
+            goto invalid_utf16;
+        } else { // BMP character
+            scalar_value = W1;
+        }
+
+        if (scalar_value < 0x80) utf8_len += 1;
+        else if (scalar_value < 0x800) utf8_len += 2;
+        else if (scalar_value < 0x10000) utf8_len += 3;
+        else if (scalar_value <= 0x10FFFF) utf8_len += 4;
+        else { goto invalid_utf16; } // Invalid scalar value
+    }
+    
+    if (utf8_len == 0 && utf16_code_units > 0) { // Should have been caught by invalid_utf16
+        goto invalid_utf16;
+    }
+     if (utf8_len == 0) { // Valid empty (e.g. if input was only invalid sequences that resulted in 0 len)
+        *out_utf8_str = bh_malloc(1); // Still need null terminator
+        if (!*out_utf8_str) { set_canon_error(error_buf, error_buf_size, "Memory allocation failed for empty UTF-8 string."); return false; }
+        (*out_utf8_str)[0] = '\0';
+        return true;
+    }
+
+
+    *out_utf8_str = bh_malloc(utf8_len + 1); // +1 for null terminator
+    if (!*out_utf8_str) {
+        set_canon_error(error_buf, error_buf_size, "Memory allocation failed for UTF-8 string.");
+        return false;
+    }
+
+    // Pass 2: Transcode
+    i = 0;
+    uint32_t utf8_idx = 0;
+    while (i < utf16_code_units) {
+        uint16_t W1 = utf16_buf[i];
+        uint32_t scalar_value;
+
+        if (W1 >= 0xD800 && W1 <= 0xDBFF) {
+            uint16_t W2 = utf16_buf[i+1]; // Already checked bounds in pass 1
+            scalar_value = 0x10000 + ((uint32_t)(W1 - 0xD800) << 10) + (uint32_t)(W2 - 0xDC00);
+            i++; 
+        } else {
+            scalar_value = W1;
+        }
+
+        if (scalar_value < 0x80) {
+            (*out_utf8_str)[utf8_idx++] = (char)scalar_value;
+        } else if (scalar_value < 0x800) {
+            (*out_utf8_str)[utf8_idx++] = (char)(0xC0 | (scalar_value >> 6));
+            (*out_utf8_str)[utf8_idx++] = (char)(0x80 | (scalar_value & 0x3F));
+        } else if (scalar_value < 0x10000) {
+            (*out_utf8_str)[utf8_idx++] = (char)(0xE0 | (scalar_value >> 12));
+            (*out_utf8_str)[utf8_idx++] = (char)(0x80 | ((scalar_value >> 6) & 0x3F));
+            (*out_utf8_str)[utf8_idx++] = (char)(0x80 | (scalar_value & 0x3F));
+        } else { // scalar_value <= 0x10FFFF
+            (*out_utf8_str)[utf8_idx++] = (char)(0xF0 | (scalar_value >> 18));
+            (*out_utf8_str)[utf8_idx++] = (char)(0x80 | ((scalar_value >> 12) & 0x3F));
+            (*out_utf8_str)[utf8_idx++] = (char)(0x80 | ((scalar_value >> 6) & 0x3F));
+            (*out_utf8_str)[utf8_idx++] = (char)(0x80 | (scalar_value & 0x3F));
+        }
+        i++;
+    }
+    (*out_utf8_str)[utf8_idx] = '\0';
+    *out_utf8_len_bytes = utf8_len;
+    return true;
+
+invalid_utf16:
+    set_canon_error(error_buf, error_buf_size, "Invalid UTF-16 sequence encountered during transcoding.");
+    if (*out_utf8_str) { // Should not happen if error before allocation
+        bh_free(*out_utf8_str);
+        *out_utf8_str = NULL;
+    }
+    *out_utf8_len_bytes = 0;
+    return false;
+}
 
 // Helper to set error messages
 static void
@@ -226,16 +463,53 @@ wasm_component_canon_lift_value(
                         set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for UTF-16 string at offset %u, code_units %u (%u bytes)", offset, length, utf16_bytes_in_wasm);
                         return false;
                     }
-                    // TODO: Implement/call transcode_utf16_to_utf8(core_mem_base + offset, length (code units), &lifted_str_ptr, &lifted_str_len_bytes);
-                    // For now, placeholder:
-                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lifting not yet implemented.");
-                    LOG_TODO("Implement UTF-16 to UTF-8 transcoding for string lifting.");
-                    return false; 
+                    uint32 utf16_bytes_in_wasm = length * sizeof(uint16_t); // length is code units
+                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, utf16_bytes_in_wasm)) {
+                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for UTF-16 string at offset %u, code_units %u (%u bytes)", offset, length, utf16_bytes_in_wasm);
+                        return false;
+                    }
+                    // Temporarily copy to a native buffer before transcoding, as utf16_to_utf8 expects a direct pointer.
+                    // This is only strictly necessary if utf16_to_utf8 cannot directly work with wasm memory pointers (e.g. due to unaligned access concerns handled by memcpy).
+                    // For a robust implementation, if direct access is problematic, this copy is safer.
+                    uint16_t *temp_utf16_buf = NULL;
+                    if (length > 0) { // Only malloc if there's data
+                        temp_utf16_buf = bh_malloc(utf16_bytes_in_wasm);
+                        if (!temp_utf16_buf) {
+                             set_canon_error(error_buf, error_buf_size, "Failed to allocate temporary buffer for UTF-16 string lifting.");
+                             return false;
+                        }
+                        bh_memcpy_s(temp_utf16_buf, utf16_bytes_in_wasm, core_mem_base + offset, utf16_bytes_in_wasm);
+                    }
+
+                    if (!utf16_to_utf8(temp_utf16_buf, length, &lifted_str_ptr, &lifted_str_len_bytes, error_buf, error_buf_size)) {
+                        if (temp_utf16_buf) bh_free(temp_utf16_buf);
+                        // error already set by utf16_to_utf8
+                        return false;
+                    }
+                    if (temp_utf16_buf) bh_free(temp_utf16_buf);
+
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
-                    // TODO: Implement inspection and transcoding for Latin1+UTF16
-                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
-                    LOG_TODO("Implement Latin1+UTF16 to UTF-8 transcoding for string lifting.");
-                    return false;
+                    LOG_TODO("Latin1+UTF16 lifting: currently treating as UTF-16. Add Latin-1 disambiguation if ABI requires.");
+                    // For now, treat as UTF-16
+                    uint32 utf16_bytes_in_wasm = length * sizeof(uint16_t);
+                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, utf16_bytes_in_wasm)) {
+                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for Latin1+UTF16 (as UTF-16) string at offset %u, code_units %u (%u bytes)", offset, length, utf16_bytes_in_wasm);
+                        return false;
+                    }
+                    uint16_t *temp_utf16_buf = NULL;
+                    if (length > 0) {
+                        temp_utf16_buf = bh_malloc(utf16_bytes_in_wasm);
+                        if (!temp_utf16_buf) {
+                             set_canon_error(error_buf, error_buf_size, "Failed to allocate temporary buffer for Latin1+UTF16 string lifting.");
+                             return false;
+                        }
+                        bh_memcpy_s(temp_utf16_buf, utf16_bytes_in_wasm, core_mem_base + offset, utf16_bytes_in_wasm);
+                    }
+                    if (!utf16_to_utf8(temp_utf16_buf, length, &lifted_str_ptr, &lifted_str_len_bytes, error_buf, error_buf_size)) {
+                         if (temp_utf16_buf) bh_free(temp_utf16_buf);
+                         return false;
+                    }
+                    if (temp_utf16_buf) bh_free(temp_utf16_buf);
                 } else {
                      set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option: %d", string_encoding);
                      return false;
@@ -924,9 +1198,10 @@ wasm_component_canon_lower_value(
                 uint32 wasm_offset = 0;
                 uint32 wasm_len = 0; // For UTF-8: bytes; For UTF-16: code units
                 void *alloc_native_ptr = NULL;
+                uint32 str_len_bytes = strlen(str_to_lower);
 
                 if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF8) {
-                    wasm_len = strlen(str_to_lower);
+                    wasm_len = str_len_bytes;
                     uint32 alloc_size_bytes = wasm_len;
 
                     if (use_wasm_realloc) {
@@ -944,21 +1219,46 @@ wasm_component_canon_lower_value(
                     if (!alloc_native_ptr && alloc_size_bytes > 0) { set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for UTF-8 string.", alloc_size_bytes); return false; }
                     if (alloc_native_ptr) bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, str_to_lower, wasm_len);
 
-                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF16) {
-                    // TODO: Implement/call transcode_utf8_to_utf16(str_to_lower, &utf16_ptr, &utf16_code_units);
-                    // wasm_len = utf16_code_units;
-                    // uint32 alloc_size_bytes = wasm_len * sizeof(uint16);
-                    // Allocate using realloc/malloc as above.
-                    // Copy utf16_ptr to alloc_native_ptr.
-                    // Free utf16_ptr if it was allocated by transcoder.
-                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lowering not yet implemented.");
-                    LOG_TODO("Implement UTF-8 to UTF-16 transcoding for string lowering.");
-                    return false;
-                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
-                    // TODO: Implement UTF-8 to Latin1/UTF16 transcoding.
-                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
-                    LOG_TODO("Implement UTF-8 to Latin1/UTF16 transcoding for string lowering.");
-                    return false;
+                } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF16 ||
+                           string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
+                    if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
+                        LOG_TODO("Latin1+UTF16 lowering: currently treating as UTF-16. Add Latin-1 optimization if required by ABI.");
+                    }
+                    uint16_t *utf16_buf = NULL;
+                    uint32_t utf16_code_units = 0;
+                    if (!utf8_to_utf16(str_to_lower, str_len_bytes, &utf16_buf, &utf16_code_units, error_buf, error_buf_size)) {
+                        // error set by utf8_to_utf16
+                        return false;
+                    }
+                    wasm_len = utf16_code_units; // wasm_len is in code units for UTF-16
+                    uint32 alloc_size_bytes = wasm_len * sizeof(uint16_t);
+
+                    if (use_wasm_realloc) {
+                        uint32 argv[4] = {0, 0, alignof(uint16_t), alloc_size_bytes};
+                        WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                        if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) {
+                            if (utf16_buf) bh_free(utf16_buf); // Free temporary buffer
+                            set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for UTF-16 string. Error: %s", wasm_runtime_get_exception(module_inst)); return false;
+                        }
+                        wasm_offset = argv[0];
+                        if (wasm_offset == 0 && alloc_size_bytes > 0) {
+                            if (utf16_buf) bh_free(utf16_buf);
+                            set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for UTF-16 string."); return false;
+                        }
+                        alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
+                    } else {
+                        alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
+                    }
+
+                    if (!alloc_native_ptr && alloc_size_bytes > 0) {
+                        if (utf16_buf) bh_free(utf16_buf);
+                        set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for UTF-16 string.", alloc_size_bytes); return false;
+                    }
+                    if (alloc_native_ptr && utf16_buf) { // utf16_buf could be NULL if empty string
+                        bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, utf16_buf, alloc_size_bytes);
+                    }
+                    if (utf16_buf) bh_free(utf16_buf); // Free temporary buffer
+
                 } else {
                     set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option for lowering: %d", string_encoding);
                     return false;
@@ -1075,21 +1375,33 @@ wasm_component_canon_lower_value(
                                                   error_buf, error_buf_size)) {
                 // If lowering an element fails, free the already allocated list memory
                 if (wasm_list_native_ptr && host_list->count > 0 && total_wasm_alloc_size > 0) {
-                     if (use_wasm_realloc) {
-                        // The canonical ABI doesn't specify a 'free' via realloc(ptr, old_size, alignment, 0).
-                        // Some reallocs might free if new_size is 0, others might not.
-                        // WAMR's default mgtc allocator does free on realloc with new_size = 0.
-                        // However, to be safe and avoid depending on specific realloc behavior not mandated
-                        // by the component model spec for the canonical 'realloc' option,
-                        // we will consider this memory "leaked" by the guest if the guest's realloc
-                        // doesn't free it and a sub-operation fails.
-                        // If a canonical 'free' option were available, it would be used here.
-                        LOG_WARNING("Partial list lowering failed after Wasm realloc. Wasm allocated memory at offset %u might be leaked if guest realloc doesn't handle this.", wasm_list_offset);
-                     } else {
+                    if (use_wasm_realloc) {
+                        // Attempt to free using the guest's realloc
+                        uint32 list_alignment = core_element_size; // Or the true element alignment if calculated
+                        uint32 free_argv[4] = {wasm_list_offset, total_wasm_alloc_size, list_alignment, 0}; /* new_size = 0 */
+                        WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                        if (realloc_f) {
+                            // Preserve original error, don't overwrite with realloc's potential new error
+                            char existing_error_buf[128]; // Temp buffer to store current error
+                            strncpy(existing_error_buf, error_buf, sizeof(existing_error_buf) -1);
+                            existing_error_buf[sizeof(existing_error_buf)-1] = '\0';
+
+                            wasm_runtime_call_wasm(exec_env, realloc_f, 4, free_argv); // Call realloc to free
+
+                            // Restore original error if it wasn't from realloc itself
+                            if (strncmp(error_buf, "Wasm realloc failed", 19) != 0) {
+                                strncpy(error_buf, existing_error_buf, error_buf_size -1);
+                                error_buf[error_buf_size-1] = '\0';
+                            }
+                            LOG_WARNING("Attempted to free list via realloc(..., 0) due to element lowering error. Original error: %s", error_buf);
+                        } else {
+                             LOG_WARNING("Cannot free list (allocated via realloc) due to missing realloc function during error handling.");
+                        }
+                    } else { // Allocated by module_malloc
                         wasm_runtime_module_free(module_inst, wasm_list_offset);
-                     }
+                    }
                 }
-                // Error message should be set by the recursive call
+                // Error message should be set by the recursive call, or above.
                 return false;
             }
         }
@@ -1164,25 +1476,44 @@ wasm_component_canon_lower_value(
         void *wasm_record_native_ptr = NULL;
         if (total_wasm_alloc_size > 0) { // Might be 0 for record with all empty fields
             wasm_record_native_ptr = wasm_runtime_module_malloc(module_inst, total_wasm_alloc_size, (void**)&wasm_record_offset);
-            if (!wasm_record_native_ptr) {
-                set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes in wasm memory for record.", total_wasm_alloc_size);
+            if (!wasm_record_native_ptr) { // Error if module_malloc failed for non-zero size
+                set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes in wasm memory for record (module_malloc).", total_wasm_alloc_size);
                 loader_free(field_core_sizes);
                 loader_free(field_core_alignments);
                 return false;
             }
-        } else {
-             // If total_wasm_alloc_size is 0 (e.g. record of empty records/tuples),
-             // wasm_record_offset can remain 0 or point to a designated static empty region if ABI requires.
-             // For now, use 0.
+        } else if (use_wasm_realloc && total_wasm_alloc_size > 0) { // Allocate using guest realloc
+            uint32 realloc_argv[4] = {0, 0, max_alignment, total_wasm_alloc_size}; // old_ptr, old_size, align, new_size
+            WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+            if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, realloc_argv)) {
+                set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for record. Error: %s", wasm_runtime_get_exception(module_inst));
+                loader_free(field_core_sizes);
+                loader_free(field_core_alignments);
+                return false;
+            }
+            wasm_record_offset = realloc_argv[0];
+            if (wasm_record_offset == 0 && total_wasm_alloc_size > 0) {
+                set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for record.");
+                loader_free(field_core_sizes);
+                loader_free(field_core_alignments);
+                return false;
+            }
+            wasm_record_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_record_offset);
+            if (!wasm_record_native_ptr && total_wasm_alloc_size > 0) {
+                 set_canon_error_v(error_buf, error_buf_size, "Wasm realloc returned invalid offset %u for record.", wasm_record_offset);
+                 loader_free(field_core_sizes);
+                 loader_free(field_core_alignments);
+                 return false;
+            }
         }
-
+        // If total_wasm_alloc_size is 0, wasm_record_native_ptr remains NULL, wasm_record_offset remains 0.
 
         // 3. Lower each field into the allocated Wasm memory
         uint32 current_offset_in_wasm_struct = 0;
         for (uint32 i = 0; i < record_type->field_count; ++i) {
             void *host_field_ptr = component_fields_ptrs[i];
             WASMComponentValType *field_val_type = record_type->fields[i].valtype;
-            uint8 field_target_core_type = VALUE_TYPE_VOID; // Type of data being written into Wasm memory for this field
+            uint8 field_target_core_type = VALUE_TYPE_VOID; 
 
             if (field_val_type->kind == VAL_TYPE_KIND_PRIMITIVE) {
                 field_target_core_type = get_core_wasm_type_for_primitive(field_val_type->u.primitive);
@@ -1190,17 +1521,25 @@ wasm_component_canon_lower_value(
                        field_val_type->kind == VAL_TYPE_KIND_STRING ||
                        field_val_type->kind == VAL_TYPE_KIND_RECORD ||
                        field_val_type->kind == VAL_TYPE_KIND_TUPLE ||
-                       field_val_type->kind == VAL_TYPE_KIND_VARIANT || // Assuming these lower to i32 offset/value
+                       field_val_type->kind == VAL_TYPE_KIND_VARIANT || 
                        field_val_type->kind == VAL_TYPE_KIND_OPTION  ||
                        field_val_type->kind == VAL_TYPE_KIND_RESULT  ||
                        field_val_type->kind == VAL_TYPE_KIND_ENUM    ||
                        field_val_type->kind == VAL_TYPE_KIND_FLAGS   ||
-                       field_val_type->kind == VAL_TYPE_KIND_OWN     ||
-                       field_val_type->kind == VAL_TYPE_KIND_BORROW) {
-                field_target_core_type = VALUE_TYPE_I32; // These lower to an offset or (offset,len) pair or handle
+                       field_val_type->kind == VAL_TYPE_KIND_OWN_TYPE_IDX || // Corrected from VAL_TYPE_KIND_OWN
+                       field_val_type->kind == VAL_TYPE_KIND_BORROW_TYPE_IDX) { // Corrected from VAL_TYPE_KIND_BORROW
+                field_target_core_type = VALUE_TYPE_I32; 
             } else {
                 set_canon_error_v(error_buf, error_buf_size, "Unhandled record field type %d for lowering field %u.", field_val_type->kind, i);
-                if (wasm_record_native_ptr) wasm_runtime_module_free(module_inst, wasm_record_offset);
+                // Attempt to free the record structure if allocated by guest realloc
+                if (use_wasm_realloc && wasm_record_offset != 0 && total_wasm_alloc_size > 0) {
+                    uint32 free_argv[4] = {wasm_record_offset, total_wasm_alloc_size, max_alignment, 0}; /* new_size = 0 */
+                    WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                    if (realloc_f) wasm_runtime_call_wasm(exec_env, realloc_f, 4, free_argv); // Ignore free failure for now
+                    LOG_WARNING("Attempted to free record via realloc(..., 0) due to field lowering error.");
+                } else if (wasm_record_native_ptr && total_wasm_alloc_size > 0) { // Allocated by module_malloc
+                    wasm_runtime_module_free(module_inst, wasm_record_offset);
+                }
                 loader_free(field_core_sizes);
                 loader_free(field_core_alignments);
                 return false;
@@ -1214,9 +1553,14 @@ wasm_component_canon_lower_value(
                                                   field_target_core_type,
                                                   core_field_write_ptr_in_wasm, 
                                                   error_buf, error_buf_size)) {
-                if (wasm_record_native_ptr && total_wasm_alloc_size > 0) wasm_runtime_module_free(module_inst, wasm_record_offset);
-                // Error message is set by recursive call, or we can set a more specific one here.
-                // For now, rely on recursive error.
+                if (use_wasm_realloc && wasm_record_offset != 0 && total_wasm_alloc_size > 0) {
+                    uint32 free_argv[4] = {wasm_record_offset, total_wasm_alloc_size, max_alignment, 0};
+                    WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                    if (realloc_f) wasm_runtime_call_wasm(exec_env, realloc_f, 4, free_argv);
+                    LOG_WARNING("Attempted to free record via realloc(..., 0) due to recursive lowering error.");
+                } else if (wasm_record_native_ptr && total_wasm_alloc_size > 0) {
+                     wasm_runtime_module_free(module_inst, wasm_record_offset);
+                }
                 loader_free(field_core_sizes);
                 loader_free(field_core_alignments);
                 return false;
@@ -1666,9 +2010,28 @@ wasm_component_canon_lower_value(
                                                   core_elem_write_ptr_in_wasm, 
                                                   error_buf, error_buf_size)) {
                 // Error, potentially free wasm_tuple_offset if allocated
-                if (wasm_tuple_native_ptr && total_wasm_alloc_size > 0) wasm_runtime_module_free(module_inst, wasm_tuple_offset);
+                if (use_wasm_realloc && wasm_tuple_offset != 0 && total_wasm_alloc_size > 0) {
+                    uint32 free_argv[4] = {wasm_tuple_offset, total_wasm_alloc_size, max_alignment, 0}; /* new_size = 0 */
+                    WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                    if (realloc_f) {
+                        char existing_error_buf[128];
+                        strncpy(existing_error_buf, error_buf, sizeof(existing_error_buf) - 1);
+                        existing_error_buf[sizeof(existing_error_buf)-1] = '\0';
+                        
+                        wasm_runtime_call_wasm(exec_env, realloc_f, 4, free_argv);
+
+                        if (strncmp(error_buf, "Wasm realloc failed", 19) != 0) {
+                           strncpy(error_buf, existing_error_buf, error_buf_size -1);
+                           error_buf[error_buf_size-1] = '\0';
+                        }
+                        LOG_WARNING("Attempted to free tuple via realloc(..., 0) due to element lowering error. Original error: %s", error_buf);
+                    } else {
+                        LOG_WARNING("Cannot free tuple (allocated via realloc) due to missing realloc function during error handling.");
+                    }
+                } else if (wasm_tuple_native_ptr && total_wasm_alloc_size > 0) { // Allocated by module_malloc
+                    wasm_runtime_module_free(module_inst, wasm_tuple_offset);
+                }
                 // Error message is set by recursive call or we can set a more specific one.
-                // For now, rely on recursive error.
                 if(element_core_sizes) loader_free(element_core_sizes);
                 if(element_core_alignments) loader_free(element_core_alignments);
                 return false;
@@ -1688,7 +2051,13 @@ wasm_component_canon_lower_value(
             // which is unlikely for non-trivial tuples with the component model ABI.
             // Or if the target expects e.g. i64 for the pointer.
             set_canon_error_v(error_buf, error_buf_size, "Tuple lowering expects target core type I32 for offset, got %u", target_core_wasm_type);
-            if (wasm_tuple_native_ptr) wasm_runtime_module_free(module_inst, wasm_tuple_offset);
+            // Freeing attempt for wasm_tuple_native_ptr if allocated by module_malloc and target type is wrong
+            if (!use_wasm_realloc && wasm_tuple_native_ptr && total_wasm_alloc_size > 0) {
+                 wasm_runtime_module_free(module_inst, wasm_tuple_offset);
+            }
+            // If use_wasm_realloc was true, the guest realloc was used. If the target type for offset is wrong,
+            // the already allocated memory in Wasm is harder to clean up here.
+            // This specific error (wrong target_core_wasm_type for the final offset) occurs *after* successfully lowering all elements.
             return false;
         }
         
@@ -1979,30 +2348,34 @@ wasm_component_canon_resource_new(
             if (defined_type->kind == DEF_TYPE_KIND_RESOURCE) {
                 WASMComponentResourceType *res_type_info = &defined_type->u.res_type;
                 if (res_type_info->dtor_func_idx != (uint32)-1) {
-                    // Assumption: The destructor core function is in the *current* module instance
-                    // if this resource.new is called from a core Wasm context.
-                    // This is a simplification. A robust solution needs to determine which core module
-                    // actually implements this resource type and its destructor.
-                    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
-                    if (module_inst) {
-                        // Validate dtor_core_func_idx against module_inst's function counts
-                        // This index is into the *defining* core module's function space.
-                        // If the resource is defined by this module_inst:
-                        if (res_type_info->dtor_func_idx < module_inst->function_count) {
-                             global_resource_table[new_handle].owner_module_inst = module_inst;
-                             global_resource_table[new_handle].dtor_core_func_idx = res_type_info->dtor_func_idx;
-                             LOG_VERBOSE("Registered destructor for resource handle %d: mod_inst %p, func_idx %u",
-                                        new_handle, module_inst, res_type_info->dtor_func_idx);
-                        } else {
-                            LOG_WARNING("Resource type %u has dtor_func_idx %u out of bounds for current module %p. Destructor not registered.",
-                                        resource_type_def_idx, res_type_info->dtor_func_idx, module_inst);
+                    WASMComponentInstanceInternal *comp_inst_internal = (WASMComponentInstanceInternal*)current_comp_inst;
+                    WASMModuleInstance *found_owner_module_inst = NULL;
+
+                    for (uint32_t mod_idx = 0; mod_idx < comp_inst_internal->num_module_instances; ++mod_idx) {
+                        WASMModuleInstance *module_inst_iter = comp_inst_internal->module_instances[mod_idx];
+                        if (module_inst_iter && res_type_info->dtor_func_idx < module_inst_iter->function_count) {
+                            // Found a module instance where this dtor_func_idx is valid.
+                            // This assumes dtor_func_idx is relative to the start of the module's function space.
+                            global_resource_table[new_handle].owner_module_inst = module_inst_iter;
+                            global_resource_table[new_handle].dtor_core_func_idx = res_type_info->dtor_func_idx;
+                            found_owner_module_inst = module_inst_iter;
+                            LOG_VERBOSE("Registered destructor for resource handle %d (type_idx %u): mod_inst %p, func_idx %u",
+                                       new_handle, resource_type_def_idx, found_owner_module_inst, res_type_info->dtor_func_idx);
+                            break; 
                         }
-                    } else {
-                        LOG_WARNING("Cannot register destructor for resource type %u: module_inst not available in exec_env.", resource_type_def_idx);
+                    }
+                    if (!found_owner_module_inst) {
+                        LOG_WARNING("Resource type %u has dtor_func_idx %u, but it could not be mapped to a function "
+                                    "in any of the component's %u instantiated core modules. Destructor not registered.",
+                                    resource_type_def_idx, res_type_info->dtor_func_idx, comp_inst_internal->num_module_instances);
+                        // Ensure owner_module_inst and dtor_core_func_idx remain NULL/(uint32)-1
+                        global_resource_table[new_handle].owner_module_inst = NULL;
+                        global_resource_table[new_handle].dtor_core_func_idx = (uint32)-1;
                     }
                 }
             } else {
-                 LOG_WARNING("Type definition at index %u is not a resource type, cannot get dtor for new resource.", resource_type_def_idx);
+                 LOG_WARNING("Type definition at index %u is not a resource type (kind %u), cannot get dtor for new resource.",
+                             resource_type_def_idx, defined_type->kind);
             }
         } else {
             LOG_WARNING("Resource type index %u out of bounds for component type definitions, cannot get dtor for new resource.", resource_type_def_idx);
@@ -2058,46 +2431,48 @@ wasm_component_canon_resource_drop(
             argv[0] = (uint32)handle; // Pass the handle as the argument
 
             WASMExecEnv *target_exec_env = NULL;
-            // Determine the correct exec_env for the call.
-            // If the current exec_env's module_inst is the owner_module, we can potentially reuse it.
-            // However, creating a temporary one or using a dedicated one for the owner_module is safer.
-            // For now, if current exec_env is not for the owner_module, this is complex.
+            WASMExecEnv *target_exec_env = NULL;
+            bool temporary_exec_env_created = false;
+
             if (wasm_runtime_get_module_inst(exec_env) == owner_module) {
                 target_exec_env = exec_env;
+                LOG_VERBOSE("Using current exec_env for same-module destructor call for handle %d.", handle);
             } else {
-                // TODO: Handle cross-module destructor calls properly. This might involve
-                // creating a temporary exec_env for owner_module or ensuring one is available.
-                // This is a complex area, especially regarding thread safety and state.
-                LOG_WARNING("Cross-module destructor call for handle %d not fully supported yet. Attempting with current exec_env.", handle);
-                // Forcing use of current exec_env might be incorrect if it's from a different module/thread context.
-                // A proper solution might involve an exec_env pool or creating one on the fly for the owner_module.
-                // For this subtask, we'll log and proceed with caution or error out.
-                // Let's try to create a temporary one if they don't match.
-                target_exec_env = wasm_exec_env_create(owner_module); // Simplified: might need cluster from owner_module
-                if (!target_exec_env) {
-                    set_canon_error_v(error_buf, error_buf_size, "Failed to create exec_env for destructor call of handle %d.", handle);
-                    // Resource will still be marked inactive below, but dtor call failed.
-                    // This error should ideally propagate, but resource_drop is often best-effort for dtor.
+                LOG_VERBOSE("Destructor for handle %d is in a different module. Creating temporary exec_env.", handle);
+                WASMCluster *cluster = owner_module->cluster; 
+                if (!cluster) {
+                    LOG_ERROR("Failed to get cluster for owner_module of resource handle %d. Cannot call destructor.", handle);
+                    // Skip destructor call, but resource will still be marked inactive.
+                } else {
+                    // Using default_stack_size from the owner_module.
+                    target_exec_env = wasm_exec_env_create_for_cluster(cluster, owner_module->default_stack_size);
+                    if (!target_exec_env) {
+                        set_canon_error_v(error_buf, error_buf_size, "Failed to create exec_env for destructor call of handle %d.", handle);
+                        // Skip destructor call.
+                    } else {
+                        temporary_exec_env_created = true;
+                        // wasm_runtime_call_wasm will associate the exec_env with owner_module for the call.
+                    }
                 }
             }
             
             if (target_exec_env) {
                 if (!wasm_runtime_call_wasm(target_exec_env, dtor_func, 1, argv)) {
-                    // Exception occurred during destructor call
-                    const char *exception = wasm_runtime_get_exception(owner_module);
-                    LOG_WARNING("Exception during destructor call for resource handle %d: %s", handle, exception);
-                    // Clear the exception on the owner_module.
-                    wasm_runtime_clear_exception(owner_module);
-                    // Even if destructor traps, the resource is considered dropped from host perspective.
+                    const char *exception = wasm_runtime_get_exception(owner_module); // Get exception from owner_module
+                    LOG_WARNING("Exception during destructor call for resource handle %d: %s", handle, exception ? exception : "N/A");
+                    if (exception) { // Clear exception only if one was actually present
+                        wasm_runtime_clear_exception(owner_module);
+                    }
                 }
 
-                if (target_exec_env != exec_env) { // If we created a temporary one
+                if (temporary_exec_env_created) {
                     wasm_exec_env_destroy(target_exec_env);
                 }
             }
+            // If target_exec_env could not be obtained/created, destructor is skipped. Resource is still dropped.
 
         } else {
-            LOG_WARNING("Destructor function with index %u not found in owner module for handle %d.", dtor_idx, handle);
+            LOG_WARNING("Destructor function with index %u not found in owner module %p for handle %d.", dtor_idx, owner_module, handle);
         }
     }
 
