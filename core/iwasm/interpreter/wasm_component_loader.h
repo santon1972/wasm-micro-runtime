@@ -152,6 +152,7 @@ typedef enum WASMComponentInstanceArgKind {
 typedef struct WASMComponentInstanceArg {
     char *name;       /* name of the argument (import name) */
     WASMComponentInstanceArgKind kind; /* Kind of item being passed as argument */
+    uint8 actual_sort; /* The actual sort byte read from binary (func=0, value=1, type=2, component=3, instance=4) */
     uint32 item_idx;  /* index of the item (e.g., func, component, instance, type, value)
                          in the current component's context, or from an outer context via alias.
                          For core module instantiation, this is the wasm_item_t (func, table, mem, global)
@@ -622,9 +623,8 @@ typedef struct WASMComponentCanonical {
            ERROR_CONTEXT_DEBUG_MESSAGE (0x1D), ERROR_CONTEXT_DROP (0x1E),
            WAITABLE_SET_NEW (0x1F), WAITABLE_SET_DROP (0x22), WAITABLE_JOIN (0x23),
            THREAD_AVAILABLE_PARALLELISM (0x42)
-           may only use options or have no specific fields other than what's parsed before options.
+           may only use options or have no specific fields before options.
            For example, YIELD has an 'async?' byte that might be parsed before options.
-           If a kind has a direct 'async?' flag (like YIELD async?), it should be parsed before options.
            However, the new CANONICAL_OPTION_ASYNC suggests 'async' is an option.
            For this structure, direct fields are preferred if they are not part of the 'opts' vector.
            Revisit specific parsing based on Binary.md details for each.

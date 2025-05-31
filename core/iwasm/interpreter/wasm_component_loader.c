@@ -259,6 +259,7 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
 {
     const uint8 *p = *p_buf;
     uint32 core_instance_count, i, j;
+    bool *imports_satisfied = NULL;
 
     read_leb_uint32(p, buf_end, core_instance_count);
     LOG_VERBOSE("Component Core Instance section with %u instances.", core_instance_count);
@@ -338,6 +339,16 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                         goto fail;
                     }
 
+                    // Allocate imports_satisfied array if this is the first arg and module has imports
+                    if (j == 0 && module_object->import_count > 0 && !imports_satisfied) {
+                        imports_satisfied = loader_malloc(module_object->import_count * sizeof(bool),
+                                                          error_buf, error_buf_size);
+                        if (!imports_satisfied) {
+                            goto fail;
+                        }
+                        memset(imports_satisfied, 0, module_object->import_count * sizeof(bool));
+                    }
+
                     bool import_found = false;
                     uint8 expected_kind = 0xFF; // Invalid kind
                     for (uint32 k = 0; k < module_object->import_count; k++) {
@@ -345,7 +356,10 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                         if (core_import->field_name != NULL && strcmp(core_import->field_name, arg->name) == 0) {
                             expected_kind = core_import->kind;
                             import_found = true;
-                            LOG_VERBOSE("Found import '%s' in module, expected kind %u, parsed kind %u.",
+                            if (imports_satisfied) {
+                                imports_satisfied[k] = true;
+                            }
+                            LOG_VERBOSE("Found import '%s' in module, expected kind %u, parsed kind %u. Marked as satisfied.",
                                         arg->name, expected_kind, arg->kind);
                             break;
                         }
@@ -410,6 +424,23 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                     }
                 }
             }
+            // After processing all arguments for CORE_INSTANCE_KIND_INSTANTIATE
+            if (imports_satisfied) {
+                uint32 target_module_idx = current_instance->u.instantiate.module_idx;
+                WASMModule *module_object = component->core_modules[target_module_idx].module_object;
+                for (uint32 k = 0; k < module_object->import_count; k++) {
+                    if (!imports_satisfied[k]) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "Unsatisfied import: '%s.%s' for core module instance %u",
+                                        module_object->imports[k].module_name,
+                                        module_object->imports[k].field_name, i);
+                        // imports_satisfied will be freed at the main fail label
+                        goto fail;
+                    }
+                }
+                wasm_runtime_free(imports_satisfied);
+                imports_satisfied = NULL;
+            }
         } else if (current_instance->kind == CORE_INSTANCE_KIND_INLINE_EXPORT) {
             read_leb_uint32(p, buf_end, current_instance->u.inline_export.export_count);
             if (current_instance->u.inline_export.export_count > 0) {
@@ -427,9 +458,33 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                     if (!parse_string(&p, buf_end, &export_item->name, error_buf, error_buf_size)) {
                         goto fail;
                     }
-                    CHECK_BUF(p, buf_end, 1); 
+                    CHECK_BUF(p, buf_end, 1);
                     export_item->kind = *p++;
+
+                    // Validate export_item->kind
+                    if (export_item->kind != WASM_EXTERNAL_FUNCTION
+                        && export_item->kind != WASM_EXTERNAL_TABLE
+                        && export_item->kind != WASM_EXTERNAL_MEMORY
+                        && export_item->kind != WASM_EXTERNAL_GLOBAL) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "invalid kind (%u) for export item '%s' in inline export group",
+                                        export_item->kind, export_item->name);
+                        goto fail;
+                    }
+
                     read_leb_uint32(p, buf_end, export_item->sort_idx);
+
+                    // Check for duplicate export names within the current inline_export group
+                    for (uint32 k = 0; k < j; k++) {
+                        WASMComponentCoreInlineExport *prev_export_item = &current_instance->u.inline_export.exports[k];
+                        if (prev_export_item->name != NULL && export_item->name != NULL &&
+                            strcmp(prev_export_item->name, export_item->name) == 0) {
+                            set_error_buf_v(error_buf, error_buf_size,
+                                            "duplicate export name '%s' in inline export group",
+                                            export_item->name);
+                            goto fail;
+                        }
+                    }
                 }
             }
         } else {
@@ -441,6 +496,10 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
     *p_buf = p;
     return true;
 fail:
+    if (imports_satisfied) {
+        wasm_runtime_free(imports_satisfied);
+        imports_satisfied = NULL; // Ensure it's not double-freed if fail is reached again
+    }
     /* component->core_instances itself will be freed by wasm_component_unload if component is not NULL */
     /* However, if we failed mid-way parsing a specific core_instance, its internal allocations need cleanup here */
     /* 'i' holds the index of the core_instance being processed when failure occurred */
@@ -797,7 +856,16 @@ load_core_type_section(const uint8 **p_buf, const uint8 *buf_end,
                 if (!func_type->param_types) goto fail; // Unloader handles func_type
                 CHECK_BUF(p, buf_end, param_count);
                 for (k = 0; k < param_count; k++) {
-                    func_type->param_types[k] = *p++;
+                    uint8 param_type_val = *p++;
+                    if (!(param_type_val == VALUE_TYPE_I32 || param_type_val == VALUE_TYPE_I64
+                          || param_type_val == VALUE_TYPE_F32 || param_type_val == VALUE_TYPE_F64
+                          /* TODO: Add V128/FUNCREF/EXTERNREF if supported */)) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "invalid parameter type 0x%02X in core function type definition %u",
+                                        param_type_val, i);
+                        goto fail;
+                    }
+                    func_type->param_types[k] = param_type_val;
                 }
             } else {
                 func_type->param_types = NULL;
@@ -811,7 +879,16 @@ load_core_type_section(const uint8 **p_buf, const uint8 *buf_end,
                 if (!func_type->result_types) goto fail; // Unloader handles func_type and potentially func_type->param_types
                 CHECK_BUF(p, buf_end, result_count);
                 for (k = 0; k < result_count; k++) {
-                    func_type->result_types[k] = *p++;
+                    uint8 result_type_val = *p++;
+                    if (!(result_type_val == VALUE_TYPE_I32 || result_type_val == VALUE_TYPE_I64
+                          || result_type_val == VALUE_TYPE_F32 || result_type_val == VALUE_TYPE_F64
+                          /* TODO: Add V128/FUNCREF/EXTERNREF if supported */)) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "invalid result type 0x%02X in core function type definition %u",
+                                        result_type_val, i);
+                        goto fail;
+                    }
+                    func_type->result_types[k] = result_type_val;
                 }
             } else {
                 func_type->result_types = NULL;
@@ -861,7 +938,33 @@ load_core_type_section(const uint8 **p_buf, const uint8 *buf_end,
                     if (!parse_string(&p, buf_end, &import_entry->field_name, error_buf, error_buf_size)) goto local_cleanup_fail;
                     CHECK_BUF(p, buf_end, 1);
                     import_entry->kind = *p++;
+                    if (import_entry->kind > WASM_EXTERNAL_GLOBAL) { /* Max valid kind is 3 */
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "invalid kind 0x%02X for core module import '%s.%s' in core module type definition %u",
+                                        import_entry->kind, import_entry->module_name, import_entry->field_name, i);
+                        goto local_cleanup_fail;
+                    }
                     read_leb_uint32(p, buf_end, import_entry->type_idx);
+
+                    /* Validate type_idx bounds */
+                    if (import_entry->type_idx >= component->core_type_def_count) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "core module import '%s.%s' in type %u: type_idx %u out of bounds %u",
+                                        import_entry->module_name, import_entry->field_name, i,
+                                        import_entry->type_idx, component->core_type_def_count);
+                        goto local_cleanup_fail;
+                    }
+
+                    /* Validate kind for function types if it's a backward reference */
+                    if (import_entry->kind == WASM_EXTERNAL_FUNCTION && import_entry->type_idx < i) {
+                        if (component->core_type_defs[import_entry->type_idx].kind != 0x60) {
+                            set_error_buf_v(error_buf, error_buf_size,
+                                            "core module import '%s.%s' in type %u: type_idx %u does not point to a core function type (actual kind 0x%02X)",
+                                            import_entry->module_name, import_entry->field_name, i,
+                                            import_entry->type_idx, component->core_type_defs[import_entry->type_idx].kind);
+                            goto local_cleanup_fail;
+                        }
+                    }
                     LOG_VERBOSE("Parsed core module import: %s.%s, kind %u, type_idx %u",
                                 import_entry->module_name, import_entry->field_name, import_entry->kind, import_entry->type_idx);
                     actual_import_count++;
@@ -870,7 +973,32 @@ load_core_type_section(const uint8 **p_buf, const uint8 *buf_end,
                     if (!parse_string(&p, buf_end, &export_entry->name, error_buf, error_buf_size)) goto local_cleanup_fail;
                     CHECK_BUF(p, buf_end, 1);
                     export_entry->kind = *p++;
+                    if (export_entry->kind > WASM_EXTERNAL_GLOBAL) { /* Max valid kind is 3 */
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "invalid kind 0x%02X for core module export '%s' in core module type definition %u",
+                                        export_entry->kind, export_entry->name, i);
+                        goto local_cleanup_fail;
+                    }
                     read_leb_uint32(p, buf_end, export_entry->type_idx); /* 'idx' in spec, use as type_idx */
+
+                    /* Validate type_idx bounds */
+                    if (export_entry->type_idx >= component->core_type_def_count) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "core module export '%s' in type %u: type_idx %u out of bounds %u",
+                                        export_entry->name, i, export_entry->type_idx, component->core_type_def_count);
+                        goto local_cleanup_fail;
+                    }
+
+                    /* Validate kind for function types if it's a backward reference */
+                    if (export_entry->kind == WASM_EXTERNAL_FUNCTION && export_entry->type_idx < i) {
+                        if (component->core_type_defs[export_entry->type_idx].kind != 0x60) {
+                            set_error_buf_v(error_buf, error_buf_size,
+                                            "core module export '%s' in type %u: type_idx %u does not point to a core function type (actual kind 0x%02X)",
+                                            export_entry->name, i, export_entry->type_idx,
+                                            component->core_type_defs[export_entry->type_idx].kind);
+                            goto local_cleanup_fail;
+                        }
+                    }
                     LOG_VERBOSE("Parsed core module export: %s, kind %u, type_idx %u",
                                 export_entry->name, export_entry->kind, export_entry->type_idx);
                     actual_export_count++;
@@ -987,6 +1115,15 @@ load_component_section(const uint8 **p_buf, const uint8 *buf_end, /* Nested Comp
         uint32 component_len;
         read_leb_uint32(p, buf_end, component_len);
         current_nested->component_len = component_len;
+
+        // Minimum length check for a valid component (magic + version + layer)
+        if (component_len < 10) { /* 4 (magic) + 4 (version) + 2 (layer) = 10 bytes */
+            set_error_buf_v(error_buf, error_buf_size,
+                            "nested component %u has invalid length %u (must be at least 10 bytes)",
+                            i, component_len);
+            goto fail;
+        }
+
         CHECK_BUF(p, buf_end, component_len);
         current_nested->component_data = (uint8*)p; 
         current_nested->parsed_component = NULL; 
@@ -1029,6 +1166,7 @@ load_instance_section(const uint8 **p_buf, const uint8 *buf_end, /* Component In
 {
     const uint8 *p = *p_buf;
     uint32 instance_count, i, j;
+    bool *core_module_imports_satisfied = NULL;
 
     read_leb_uint32(p, buf_end, instance_count);
     LOG_VERBOSE("Component Instance section with %u instances.", instance_count);
@@ -1052,8 +1190,50 @@ load_instance_section(const uint8 **p_buf, const uint8 *buf_end, /* Component In
     for (i = 0; i < instance_count; i++) {
         WASMComponentInstance *current_inst = &component->component_instances[i];
         CHECK_BUF(p, buf_end, 1);
-        current_inst->instance_kind = *p++; 
-        read_leb_uint32(p, buf_end, current_inst->item_idx); 
+        current_inst->instance_kind = *p++;
+
+        // Validate instance_kind
+        if (current_inst->instance_kind != 0x00 && current_inst->instance_kind != 0x01) {
+            set_error_buf_v(error_buf, error_buf_size,
+                            "invalid instance kind 0x%02X for component instance %u",
+                            current_inst->instance_kind, i);
+            goto fail;
+        }
+
+        read_leb_uint32(p, buf_end, current_inst->item_idx);
+
+        // Validate item_idx
+        if (current_inst->instance_kind == 0x00) { // Core module instance
+            if (current_inst->item_idx >= component->core_module_count) {
+                set_error_buf_v(error_buf, error_buf_size,
+                                "component instance %u attempts to instantiate core module with out-of-bounds index %u (core module count %u)",
+                                i, current_inst->item_idx, component->core_module_count);
+                goto fail;
+            }
+            WASMModule *core_module = component->core_modules[current_inst->item_idx].module_object;
+            if (!core_module) { // Check if module_object itself is NULL
+                set_error_buf_v(error_buf, error_buf_size,
+                                "component instance %u attempts to instantiate core module %u which failed to load or is NULL",
+                                i, current_inst->item_idx);
+                goto fail;
+            }
+            if (core_module->import_count > 0) {
+                uint32 import_count_size = core_module->import_count * sizeof(bool);
+                core_module_imports_satisfied = loader_malloc(import_count_size, error_buf, error_buf_size);
+                if (!core_module_imports_satisfied) {
+                    goto fail;
+                }
+                memset(core_module_imports_satisfied, 0, import_count_size);
+            }
+        } else { // Component instance (instance_kind == 0x01)
+            if (current_inst->item_idx >= component->nested_component_count) {
+                set_error_buf_v(error_buf, error_buf_size,
+                                "component instance %u attempts to instantiate nested component with out-of-bounds index %u (nested component count %u)",
+                                i, current_inst->item_idx, component->nested_component_count);
+                goto fail;
+            }
+        }
+
         read_leb_uint32(p, buf_end, current_inst->arg_count);
 
         if (current_inst->arg_count > 0) {
@@ -1073,15 +1253,107 @@ load_instance_section(const uint8 **p_buf, const uint8 *buf_end, /* Component In
                 uint8 item_sort_byte;
                 CHECK_BUF(p, buf_end, 1);
                 item_sort_byte = *p++;
-                // TODO: Store and use item_sort_byte for validation. For now, just log it.
-                // arg->kind is WAMR's internal INSTANCE_ARG_KIND_*, not the component model <sort>.
+                arg->actual_sort = item_sort_byte; // Store the sort byte
+
+                // Validate item_sort_byte
+                if (item_sort_byte > 0x04) { /* Max valid sort is 0x04 (Instance) */
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "component instance %u argument %u ('%s'): invalid item sort 0x%02X",
+                                    i, j, arg->name, item_sort_byte);
+                    goto fail;
+                }
                 
                 read_leb_uint32(p, buf_end, arg->item_idx);
-                arg->kind = INSTANCE_ARG_KIND_ITEM_IDX; 
-                LOG_VERBOSE("  Arg %u: name '%s', parsed_sort 0x%02X, item_idx %u (WAMR kind %u)",
-                            j, arg->name, item_sort_byte, arg->item_idx, arg->kind);
+                arg->kind = INSTANCE_ARG_KIND_ITEM_IDX; // WAMR internal kind
+
+                if (current_inst->instance_kind == 0x00) { // Core module instance arguments
+                    WASMModule *core_module = component->core_modules[current_inst->item_idx].module_object;
+                    WASMImport *matched_core_import = NULL;
+                    for (uint32 k = 0; k < core_module->import_count; k++) {
+                        if (core_module->imports[k].field_name != NULL
+                            && strcmp(arg->name, core_module->imports[k].field_name) == 0) {
+                            matched_core_import = &core_module->imports[k];
+                            if (core_module_imports_satisfied) {
+                                core_module_imports_satisfied[k] = true;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!matched_core_import) {
+                        set_error_buf_v(error_buf, error_buf_size,
+                                        "component instance %u argument '%s' for core module %u: no matching import found in core module",
+                                        i, arg->name, current_inst->item_idx);
+                        goto fail;
+                    }
+
+                    switch (matched_core_import->kind) {
+                        case WASM_EXTERNAL_FUNCTION:
+                            if (arg->actual_sort != 0x00) { // Function sort
+                                set_error_buf_v(error_buf, error_buf_size,
+                                                "component instance %u argument '%s': import is a function, but provided item sort is 0x%02X",
+                                                i, arg->name, arg->actual_sort);
+                                goto fail;
+                            }
+                            // TODO: Validate arg->item_idx %u against component's total function index space.
+                            break;
+                        case WASM_EXTERNAL_GLOBAL:
+                            if (arg->actual_sort != 0x01) { // Value sort
+                                set_error_buf_v(error_buf, error_buf_size,
+                                                "component instance %u argument '%s': import is a global, but provided item sort is 0x%02X",
+                                                i, arg->name, arg->actual_sort);
+                                goto fail;
+                            }
+                            if (arg->item_idx >= component->value_count) {
+                                set_error_buf_v(error_buf, error_buf_size,
+                                                "component instance %u argument '%s': value item_idx %u out of bounds for component values (count %u)",
+                                                i, arg->name, arg->item_idx, component->value_count);
+                                goto fail;
+                            }
+                            // TODO: Validate type of component->values[arg->item_idx] against matched_core_import->global_type.
+                            break;
+                        case WASM_EXTERNAL_TABLE:
+                            set_error_buf_v(error_buf, error_buf_size,
+                                            "component instance %u argument '%s': satisfying table imports from component instance arguments is not yet supported",
+                                            i, arg->name);
+                            goto fail;
+                        case WASM_EXTERNAL_MEMORY:
+                            set_error_buf_v(error_buf, error_buf_size,
+                                            "component instance %u argument '%s': satisfying memory imports from component instance arguments is not yet supported",
+                                            i, arg->name);
+                            goto fail;
+                        default:
+                            set_error_buf_v(error_buf, error_buf_size,
+                                            "component instance %u argument '%s': unknown core import kind 0x%02X",
+                                            i, arg->name, matched_core_import->kind);
+                            goto fail;
+                    }
+                }
+                // Else (instance_kind == 0x01), argument validation for component instances is handled later or differently.
+
+                LOG_VERBOSE("  Arg %u: name '%s', actual_sort 0x%02X, item_idx %u (WAMR kind %u)",
+                            j, arg->name, arg->actual_sort, arg->item_idx, arg->kind);
             }
         }
+
+        if (current_inst->instance_kind == 0x00 && core_module_imports_satisfied) {
+            WASMModule *core_module = component->core_modules[current_inst->item_idx].module_object;
+            for (uint32 k = 0; k < core_module->import_count; k++) {
+                if (!core_module_imports_satisfied[k]) {
+                    set_error_buf_v(error_buf, error_buf_size,
+                                    "Component instance %u (core module %u): unsatisfied import '%s':'%s'",
+                                    i, current_inst->item_idx,
+                                    core_module->imports[k].module_name,
+                                    core_module->imports[k].field_name);
+                    goto fail;
+                }
+            }
+        }
+        if (core_module_imports_satisfied) {
+            wasm_runtime_free(core_module_imports_satisfied);
+            core_module_imports_satisfied = NULL;
+        }
+
         LOG_VERBOSE("Instance %u: kind %s, item_idx %u, arg_count %u", i,
                     current_inst->instance_kind == 0 ? "core" : "component",
                     current_inst->item_idx, current_inst->arg_count);
@@ -1090,6 +1362,10 @@ load_instance_section(const uint8 **p_buf, const uint8 *buf_end, /* Component In
     *p_buf = p;
     return true;
 fail:
+    if (core_module_imports_satisfied) {
+        wasm_runtime_free(core_module_imports_satisfied);
+        core_module_imports_satisfied = NULL;
+    }
     return false;
 }
 
@@ -1127,33 +1403,176 @@ load_alias_section(const uint8 **p_buf, const uint8 *buf_end,
 
         CHECK_BUF(p, buf_end, 1); 
         sort_byte = *p++;
+        // Validate sort_byte before assigning to current_alias->sort
+        if (sort_byte > ALIAS_SORT_COMPONENT) { // ALIAS_SORT_COMPONENT is 0x06, the max valid sort
+            set_error_buf_v(error_buf, error_buf_size, "alias %u: invalid sort 0x%02X", i, sort_byte);
+            goto fail;
+        }
         current_alias->sort = (WASMAliasSort)sort_byte;
 
         CHECK_BUF(p, buf_end, 1); 
         target_kind_byte = *p++;
+        // Validate target_kind_byte before assigning to current_alias->target_kind
+        // Assuming ALIAS_TARGET_OUTER would be 0x05 if enum is contiguous.
+        // The switch statement's default case will also catch truly unknown values.
+        if (target_kind_byte > 0x05) { // Max expected: ALIAS_TARGET_CORE_EXPORT(0)..ALIAS_TARGET_INSTANCE(4), ALIAS_TARGET_OUTER(5)
+            set_error_buf_v(error_buf, error_buf_size, "alias %u: invalid target kind 0x%02X", i, target_kind_byte);
+            goto fail;
+        }
         current_alias->target_kind = (WASMAliasTargetKind)target_kind_byte;
 
-        current_alias->target_name = NULL; 
+        current_alias->target_name = NULL;
 
         switch (current_alias->target_kind) {
-            case ALIAS_TARGET_CORE_EXPORT: 
-                read_leb_uint32(p, buf_end, current_alias->target_idx); 
+            case ALIAS_TARGET_CORE_EXPORT:
+            {
+                if (current_alias->sort > ALIAS_SORT_CORE_GLOBAL) { // Func, Table, Memory, Global
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: invalid sort 0x%02X for core export alias", i, current_alias->sort);
+                    goto fail;
+                }
+                read_leb_uint32(p, buf_end, current_alias->target_idx); // core instance index
+                if (current_alias->target_idx >= component->core_instance_count) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: core instance index %u out of bounds (%u) for core export alias",
+                                    i, current_alias->target_idx, component->core_instance_count);
+                    goto fail;
+                }
                 if (!parse_string(&p, buf_end, &current_alias->target_name, error_buf, error_buf_size)) {
                     goto fail;
                 }
+
+                WASMComponentCoreInstance *core_inst = &component->core_instances[current_alias->target_idx];
+                uint8 expected_core_kind;
+                switch (current_alias->sort) {
+                    case ALIAS_SORT_CORE_FUNC: expected_core_kind = WASM_EXTERNAL_FUNCTION; break;
+                    case ALIAS_SORT_CORE_TABLE: expected_core_kind = WASM_EXTERNAL_TABLE; break;
+                    case ALIAS_SORT_CORE_MEMORY: expected_core_kind = WASM_EXTERNAL_MEMORY; break;
+                    case ALIAS_SORT_CORE_GLOBAL: expected_core_kind = WASM_EXTERNAL_GLOBAL; break;
+                    default: /* Should have been caught by the sort check above */
+                        set_error_buf_v(error_buf, error_buf_size, "alias %u: unexpected sort 0x%02X for core export validation", i, current_alias->sort);
+                        goto fail;
+                }
+
+                bool export_found = false;
+                if (core_inst->kind == CORE_INSTANCE_KIND_INSTANTIATE) {
+                    if (core_inst->u.instantiate.module_idx >= component->core_module_count) {
+                         set_error_buf_v(error_buf, error_buf_size, "alias %u: target core instance %u has invalid module_idx %u (count %u)",
+                                        i, current_alias->target_idx, core_inst->u.instantiate.module_idx, component->core_module_count);
+                        goto fail;
+                    }
+                    WASMModule *module = component->core_modules[core_inst->u.instantiate.module_idx].module_object;
+                    if (!module) {
+                        set_error_buf_v(error_buf, error_buf_size, "alias %u: target core instance %u module not loaded", i, current_alias->target_idx);
+                        goto fail;
+                    }
+                    for (uint32 k = 0; k < module->export_count; k++) {
+                        if (strcmp(module->exports[k].name, current_alias->target_name) == 0
+                            && module->exports[k].kind == expected_core_kind) {
+                            export_found = true;
+                            break;
+                        }
+                    }
+                } else if (core_inst->kind == CORE_INSTANCE_KIND_INLINE_EXPORT) {
+                    for (uint32 k = 0; k < core_inst->u.inline_export.export_count; k++) {
+                        if (strcmp(core_inst->u.inline_export.exports[k].name, current_alias->target_name) == 0
+                            && core_inst->u.inline_export.exports[k].kind == expected_core_kind) {
+                            export_found = true;
+                            break;
+                        }
+                    }
+                } else {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: target core instance %u has unknown kind %u",
+                                    i, current_alias->target_idx, core_inst->kind);
+                    goto fail;
+                }
+
+                if (!export_found) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: core export '%s' of sort 0x%02X not found or kind mismatch in core instance %u",
+                                    i, current_alias->target_name, current_alias->sort, current_alias->target_idx);
+                    goto fail;
+                }
                 break;
+            }
             case ALIAS_TARGET_OUTER:
-                 read_leb_uint32(p, buf_end, current_alias->target_outer_depth);
-                 read_leb_uint32(p, buf_end, current_alias->target_idx);
-                 break;
-            case ALIAS_TARGET_CORE_MODULE: 
-            case ALIAS_TARGET_TYPE:        
-            case ALIAS_TARGET_COMPONENT:   
-            case ALIAS_TARGET_INSTANCE:    
+                read_leb_uint32(p, buf_end, current_alias->target_outer_depth);
                 read_leb_uint32(p, buf_end, current_alias->target_idx);
+                if (current_alias->target_outer_depth == 0) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: target_outer_depth cannot be 0 for outer alias", i);
+                    goto fail;
+                }
+                // TODO: Full validation of outer alias target_idx (value %u for sort 0x%02X at depth %u) requires linker context.
                 break;
+            case ALIAS_TARGET_CORE_MODULE:
+                read_leb_uint32(p, buf_end, current_alias->target_idx);
+                if (current_alias->sort != ALIAS_SORT_CORE_MODULE) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: invalid sort 0x%02X for core module alias (expected 0x04)", i, current_alias->sort);
+                    goto fail;
+                }
+                if (current_alias->target_idx >= component->core_module_count) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: core module index %u out of bounds (%u) for core module alias",
+                                    i, current_alias->target_idx, component->core_module_count);
+                    goto fail;
+                }
+                if (component->core_modules[current_alias->target_idx].module_object == NULL) {
+                     set_error_buf_v(error_buf, error_buf_size, "alias %u: target core module %u not loaded for core module alias",
+                                    i, current_alias->target_idx);
+                    goto fail;
+                }
+                break;
+            case ALIAS_TARGET_TYPE:
+                read_leb_uint32(p, buf_end, current_alias->target_idx);
+                if (current_alias->sort != ALIAS_SORT_TYPE) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: invalid sort 0x%02X for type alias (expected 0x05)", i, current_alias->sort);
+                    goto fail;
+                }
+                if (current_alias->target_idx >= component->type_definition_count) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: type definition index %u out of bounds (%u) for type alias",
+                                    i, current_alias->target_idx, component->type_definition_count);
+                    goto fail;
+                }
+                break;
+            case ALIAS_TARGET_COMPONENT:
+                read_leb_uint32(p, buf_end, current_alias->target_idx);
+                 if (current_alias->sort != ALIAS_SORT_COMPONENT) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: invalid sort 0x%02X for component alias (expected 0x06)", i, current_alias->sort);
+                    goto fail;
+                }
+                if (current_alias->target_idx >= component->nested_component_count) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: nested component index %u out of bounds (%u) for component alias",
+                                    i, current_alias->target_idx, component->nested_component_count);
+                    goto fail;
+                }
+                break;
+            case ALIAS_TARGET_INSTANCE:
+            {
+                read_leb_uint32(p, buf_end, current_alias->target_idx);
+                if (current_alias->target_idx >= component->component_instance_count) {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: component instance index %u out of bounds (%u) for instance alias",
+                                    i, current_alias->target_idx, component->component_instance_count);
+                    goto fail;
+                }
+                WASMComponentInstance *comp_inst = &component->component_instances[current_alias->target_idx];
+                if (current_alias->sort == ALIAS_SORT_CORE_MODULE) {
+                    if (comp_inst->instance_kind != 0x00) { /* core module instance */
+                        set_error_buf_v(error_buf, error_buf_size, "alias %u: sort 0x%02X (core module) incompatible with target component instance %u kind %u",
+                                        i, current_alias->sort, current_alias->target_idx, comp_inst->instance_kind);
+                        goto fail;
+                    }
+                } else if (current_alias->sort == ALIAS_SORT_COMPONENT) {
+                    if (comp_inst->instance_kind != 0x01) { /* component instance */
+                         set_error_buf_v(error_buf, error_buf_size, "alias %u: sort 0x%02X (component) incompatible with target component instance %u kind %u",
+                                        i, current_alias->sort, current_alias->target_idx, comp_inst->instance_kind);
+                        goto fail;
+                    }
+                } else {
+                    set_error_buf_v(error_buf, error_buf_size, "alias %u: sort 0x%02X not supported for targeting a component instance of kind %u",
+                                    i, current_alias->sort, comp_inst->instance_kind);
+                    goto fail;
+                }
+                break;
+            }
             default:
-                set_error_buf_v(error_buf, error_buf_size, "unknown alias target kind: %u", current_alias->target_kind);
+                // This case should ideally be caught by the target_kind_byte validation done earlier
+                set_error_buf_v(error_buf, error_buf_size, "alias %u: unknown or unhandled alias target kind 0x%02X in switch", i, current_alias->target_kind);
                 goto fail;
         }
         LOG_VERBOSE("Alias %u: sort %u, target_kind %u, target_idx %u, target_name %s",
