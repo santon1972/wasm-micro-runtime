@@ -7,6 +7,14 @@
 #include "wasm_export.h"
 #include "bh_log.h"
 
+/*
+ * Note: This TID allocator is NOT internally thread-safe.
+ * All public functions (tid_allocator_get_tid, tid_allocator_release_tid)
+ * must be protected by an external mutex if used in a concurrent environment.
+ * In WAMR, this protection is provided by `thread_id_lock` in
+ * `lib_wasi_threads_wrapper.c`.
+ */
+
 bh_static_assert(TID_MIN <= TID_MAX);
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 

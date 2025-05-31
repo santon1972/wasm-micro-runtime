@@ -88,7 +88,17 @@ typedef struct WAMRHostResourceEntry {
     uint32_t component_resource_type_idx; /* Type index of the resource within the component's type definitions */
     void *host_data;                    /* Pointer to actual host-specific data for the resource (if any) */
                                         /* For now, this will be NULL. Actual resource methods would manage this. */
+    // --- Fields for Destructor Support ---
+    WASMModuleInstance *owner_module_inst;  /* Module instance that owns the destructor */
+    uint32 dtor_core_func_idx;          /* Core function index of the destructor within owner_module_inst. (uint32)-1 if no dtor. */
 } WAMRHostResourceEntry;
+
+// Declaration for the global resource table (defined in wasm_component_canonical.c)
+// This is needed for wasm_component_runtime.c to access destructor information.
+// Ensure MAX_RESOURCE_HANDLES is defined consistently or also exposed.
+#define MAX_RESOURCE_HANDLES 128 // Matching the definition in .c file. Consider moving to a shared const.
+extern WAMRHostResourceEntry global_resource_table[MAX_RESOURCE_HANDLES];
+
 
 /**
  * Creates a new resource handle.

@@ -2264,6 +2264,32 @@ wasm_component_canon_resource_new(
 
     *(int32_t*)core_value_write_ptr = (int32_t)new_handle;
     LOG_VERBOSE("Created new resource handle %d for component type idx %u", new_handle, global_resource_table[new_handle].component_resource_type_idx);
+
+    // Add to active resource list of the owning component instance
+    if (current_comp_inst) { // current_comp_inst is WASMComponentInstance* (effectively internal)
+        WASMComponentInstanceInternal *owning_comp_inst_internal = (WASMComponentInstanceInternal*)current_comp_inst;
+        ActiveResourceHandle *active_handle_node = loader_malloc(sizeof(ActiveResourceHandle), error_buf, error_buf_size);
+        if (!active_handle_node) {
+            // Failed to allocate node. This is problematic as the resource is already in global_resource_table.
+            // For now, log error and continue. Resource will be cleaned up by deinstantiate if not dropped.
+            // Or, we could try to 'undo' the resource creation, but that's complex.
+            LOG_ERROR("Failed to allocate ActiveResourceHandle node for handle %d. Resource tracking may be incomplete.", new_handle);
+            // No need to set error_buf here as the main operation succeeded.
+        } else {
+            active_handle_node->resource_type_idx = global_resource_table[new_handle].component_resource_type_idx;
+            active_handle_node->resource_handle_core_value = new_handle;
+            active_handle_node->next = NULL;
+
+            os_mutex_lock(&owning_comp_inst_internal->active_resource_list_lock);
+            active_handle_node->next = owning_comp_inst_internal->active_resource_list_head;
+            owning_comp_inst_internal->active_resource_list_head = active_handle_node;
+            os_mutex_unlock(&owning_comp_inst_internal->active_resource_list_lock);
+            LOG_VERBOSE("Added resource handle %d to active list of component instance %p", new_handle, (void*)owning_comp_inst_internal);
+        }
+    } else {
+        LOG_WARNING("Resource handle %d created, but owning component instance not found. Cannot add to active list.", new_handle);
+    }
+
     return true;
 }
 
@@ -2347,6 +2373,45 @@ wasm_component_canon_resource_drop(
     global_resource_table[handle].dtor_core_func_idx = (uint32)-1;
 
     LOG_VERBOSE("Dropped resource handle %d", handle);
+
+    // Remove from active resource list of the owning component instance
+    WASMComponentInstance *current_comp_inst = wasm_runtime_get_component_instance(exec_env);
+    if (owner_module && owner_module->component_inst) {
+         // If the resource had an owner_module_inst, it's more reliable to get the component instance from there,
+         // as exec_env might be for a different component if there are cross-component calls.
+         // However, the active_resource_list is per-component-instance that *owns* the resource's type definition or alias.
+         // The current_comp_inst from exec_env is likely the one that initiated the drop.
+         // This needs careful consideration if resources are shared or passed between components.
+         // For now, assume the resource is dropped by its conceptual owner or within its owning component's context.
+         // Using current_comp_inst from exec_env, assuming it's the context of the resource's owner.
+    }
+
+
+    if (current_comp_inst) {
+        WASMComponentInstanceInternal *owning_comp_inst_internal = (WASMComponentInstanceInternal*)current_comp_inst;
+        os_mutex_lock(&owning_comp_inst_internal->active_resource_list_lock);
+        ActiveResourceHandle **p_current = &owning_comp_inst_internal->active_resource_list_head;
+        ActiveResourceHandle *found_node = NULL;
+        while (*p_current) {
+            if ((*p_current)->resource_handle_core_value == (uint32_t)handle) {
+                found_node = *p_current;
+                *p_current = (*p_current)->next; // Unlink
+                break;
+            }
+            p_current = &(*p_current)->next;
+        }
+        os_mutex_unlock(&owning_comp_inst_internal->active_resource_list_lock);
+
+        if (found_node) {
+            loader_free(found_node);
+            LOG_VERBOSE("Removed resource handle %d from active list of component instance %p", handle, (void*)owning_comp_inst_internal);
+        } else {
+            LOG_WARNING("Resource handle %d was dropped, but not found in active list of component instance %p. May indicate prior cleanup or tracking issue.", handle, (void*)owning_comp_inst_internal);
+        }
+    } else {
+        LOG_WARNING("Resource handle %d dropped, but current component instance not found. Cannot remove from active list.", handle);
+    }
+
     return true;
 }
 

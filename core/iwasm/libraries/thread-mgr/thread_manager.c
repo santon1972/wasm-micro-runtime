@@ -722,6 +722,18 @@ wasm_cluster_create_thread(WASMExecEnv *exec_env,
     if (!new_exec_env)
         goto fail1;
 
+    /*
+     * Note on locking: Callers like thread_spawn_wrapper (from lib_wasi_threads_wrapper.c)
+     * manage their own locks (e.g., thread_id_lock for TID allocation).
+     * Functions called here during new thread setup (e.g., wasm_exec_env_create_internal,
+     * wasm_cluster_add_exec_env, os_thread_create) operate primarily under
+     * cluster->lock or new_exec_env->wait_lock. These operations should not
+     * make blocking calls back into systems that might require thread_id_lock
+     * to avoid potential deadlocks if thread_id_lock were held by the caller
+     * across the call to wasm_cluster_create_thread (which is not the current pattern
+     * in thread_spawn_wrapper, as thread_id_lock is released before this call).
+     */
+
     if (is_aux_stack_allocated) {
         /* Set aux stack for current thread */
         if (!wasm_exec_env_set_aux_stack(new_exec_env, aux_stack_start,

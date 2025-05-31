@@ -1073,8 +1073,60 @@ wasm_component_instance_deinstantiate(WASMComponentInstanceInternal *comp_inst)
             if (type_def && type_def->kind == DEF_TYPE_KIND_RESOURCE) {
                 WASMComponentResourceType *res_type = &type_def->u.res_type;
                 if (res_type->dtor_func_idx != (uint32)-1) {
-                    LOG_TODO("Destructor call for resource type_idx %u, dtor_func_idx %u, handle %u needs full implementation (finding module and function, then calling wasm_runtime_call_wasm).",
-                             current_handle->resource_type_idx, res_type->dtor_func_idx, current_handle->resource_handle_core_value);
+                    uint32_t handle_val = current_handle->resource_handle_core_value;
+                    WASMModuleInstance *dtor_owner_module = NULL;
+                    uint32 dtor_func_idx_in_module = (uint32)-1;
+
+                    // Retrieve destructor info from the global resource table
+                    if (handle_val > 0 && handle_val < MAX_RESOURCE_HANDLES) {
+                        // Accessing global_resource_table declared extern from wasm_component_canonical.h
+                        dtor_owner_module = global_resource_table[handle_val].owner_module_inst;
+                        dtor_func_idx_in_module = global_resource_table[handle_val].dtor_core_func_idx;
+                    } else {
+                        LOG_WARNING("Deinstantiate: Invalid handle value %u found in active resource list.", handle_val);
+                    }
+
+                    if (dtor_owner_module && dtor_func_idx_in_module != (uint32)-1) {
+                        WASMFunctionInstance *dtor_func = wasm_runtime_get_function(dtor_owner_module, dtor_func_idx_in_module);
+                        if (dtor_func) {
+                            uint32 argv[1] = { handle_val };
+                            // TODO: Determine the correct exec_env. Using the dtor_owner_module's default exec_env.
+                            // This might need refinement if exec_env needs to be specific to the component instance
+                            // or if cross-thread calls are possible.
+                            WASMExecEnv *exec_env_for_dtor = dtor_owner_module->exec_env;
+                            if (exec_env_for_dtor) { // Ensure exec_env is not NULL
+                                LOG_VERBOSE("Deinstantiate: Calling destructor (func_idx %u in module %p) for resource handle %u",
+                                            dtor_func_idx_in_module, (void*)dtor_owner_module, handle_val);
+                                if (!wasm_runtime_call_wasm(exec_env_for_dtor, dtor_func, 1, argv)) {
+                                    LOG_WARNING("Destructor call failed for resource (type_idx: %u, handle: %u): %s",
+                                                current_handle->resource_type_idx, handle_val,
+                                                wasm_runtime_get_exception(dtor_owner_module));
+                                    wasm_runtime_clear_exception(dtor_owner_module);
+                                } else {
+                                    LOG_VERBOSE("Successfully called destructor for resource (type_idx: %u, handle: %u)",
+                                                current_handle->resource_type_idx, handle_val);
+                                }
+                            } else {
+                                LOG_WARNING("Deinstantiate: Cannot call destructor for handle %u, owner module %p has NULL exec_env.",
+                                            handle_val, (void*)dtor_owner_module);
+                            }
+                        } else {
+                            LOG_WARNING("Deinstantiate: Destructor function (idx %u) not found in its module %p for resource type_idx %u, handle %u.",
+                                        dtor_func_idx_in_module, (void*)dtor_owner_module, current_handle->resource_type_idx, handle_val);
+                        }
+                    } else {
+                        LOG_WARNING("Deinstantiate: Destructor module instance or function index not available in global_resource_table for resource handle %u (type_idx %u). Original dtor_func_idx from type: %u.",
+                                    handle_val, current_handle->resource_type_idx, res_type->dtor_func_idx);
+                    }
+
+                    // Mark the resource as inactive in the global table, as it's being implicitly dropped.
+                    if (handle_val > 0 && handle_val < MAX_RESOURCE_HANDLES) {
+                        global_resource_table[handle_val].is_active = false;
+                        global_resource_table[handle_val].host_data = NULL; // Clear host data
+                        global_resource_table[handle_val].owner_module_inst = NULL;
+                        global_resource_table[handle_val].dtor_core_func_idx = (uint32)-1;
+                        LOG_VERBOSE("Deinstantiate: Marked global_resource_table entry for handle %u as inactive.", handle_val);
+                    }
                     /*
                     // Conceptual full implementation:
                     // 1. Resolve dtor_func_idx to a WASMModuleInstance* and func_idx_in_module.
