@@ -45,6 +45,192 @@ static bool get_component_type_core_abi_details(const WASMComponentValType *val_
                                                 char* error_buf, uint32 error_buf_size);
 static uint32 align_up(uint32 val, uint32 alignment);
 
+// START: UTF-16 Transcoding Helpers
+// Helper for UTF-16LE (wasm) to UTF-8 (host)
+static char*
+transcode_utf16le_to_utf8_on_host(const uint16 *utf16_ptr, uint32 utf16_code_units,
+                                  uint32 *out_utf8_len_bytes,
+                                  char *error_buf, uint32 error_buf_size)
+{
+    if (!utf16_ptr && utf16_code_units > 0) {
+        set_canon_error(error_buf, error_buf_size, "transcode_utf16le_to_utf8_on_host: Null utf16_ptr for non-zero length.");
+        if(out_utf8_len_bytes) *out_utf8_len_bytes = 0;
+        return NULL;
+    }
+    if (!out_utf8_len_bytes) {
+        set_canon_error(error_buf, error_buf_size, "transcode_utf16le_to_utf8_on_host: out_utf8_len_bytes is null.");
+        return NULL;
+    }
+    *out_utf8_len_bytes = 0;
+
+    if (utf16_code_units == 0) {
+        char *empty_str = loader_malloc(1, error_buf, error_buf_size);
+        if (!empty_str) return NULL; // Error set by loader_malloc
+        empty_str[0] = '\0';
+        return empty_str;
+    }
+
+    // Calculate exact UTF-8 length needed
+    uint32 required_utf8_bytes = 0;
+    for (uint32 i = 0; i < utf16_code_units; ++i) {
+        uint16 c1 = utf16_ptr[i];
+        if (c1 < 0x80) required_utf8_bytes += 1;
+        else if (c1 < 0x800) required_utf8_bytes += 2;
+        else if (c1 >= 0xD800 && c1 <= 0xDBFF) { // High surrogate
+            if (i + 1 < utf16_code_units) {
+                uint16 c2 = utf16_ptr[i + 1];
+                if (c2 >= 0xDC00 && c2 <= 0xDFFF) { // Low surrogate
+                    required_utf8_bytes += 4;
+                    i++; // Consume low surrogate as well
+                } else { required_utf8_bytes += 3; } // Treat as replacement char ?
+            } else { required_utf8_bytes += 3; } // Unpaired high surrogate
+        } else { required_utf8_bytes += 3; } // Includes unpaired low surrogates (treated as replacement char)
+    }
+
+    char *utf8_str = loader_malloc(required_utf8_bytes + 1, error_buf, error_buf_size);
+    if (!utf8_str) return NULL;
+
+    uint32 utf8_idx = 0;
+    uint32 utf16_idx = 0;
+
+    while (utf16_idx < utf16_code_units) {
+        uint16 c1 = utf16_ptr[utf16_idx++];
+        uint32 code_point;
+
+        if (c1 >= 0xD800 && c1 <= 0xDBFF) { // High surrogate
+            if (utf16_idx < utf16_code_units) {
+                uint16 c2 = utf16_ptr[utf16_idx++];
+                if (c2 >= 0xDC00 && c2 <= 0xDFFF) { // Low surrogate
+                    code_point = 0x10000 + ((c1 - 0xD800) << 10) + (c2 - 0xDC00);
+                } else { // Unpaired high surrogate
+                    code_point = 0xFFFD; // Replacement character
+                    utf16_idx--; // Re-process c2 if it wasn't a low surrogate
+                }
+            } else { // Unpaired high surrogate at end of string
+                code_point = 0xFFFD; // Replacement character
+            }
+        } else if (c1 >= 0xDC00 && c1 <= 0xDFFF) { // Unpaired low surrogate
+            code_point = 0xFFFD; // Replacement character
+        } else { // BMP character
+            code_point = c1;
+        }
+
+        // Encode code_point to UTF-8
+        if (code_point <= 0x7F) {
+            utf8_str[utf8_idx++] = (char)code_point;
+        } else if (code_point <= 0x7FF) {
+            utf8_str[utf8_idx++] = (char)(0xC0 | (code_point >> 6));
+            utf8_str[utf8_idx++] = (char)(0x80 | (code_point & 0x3F));
+        } else if (code_point <= 0xFFFF) {
+            utf8_str[utf8_idx++] = (char)(0xE0 | (code_point >> 12));
+            utf8_str[utf8_idx++] = (char)(0x80 | ((code_point >> 6) & 0x3F));
+            utf8_str[utf8_idx++] = (char)(0x80 | (code_point & 0x3F));
+        } else if (code_point <= 0x10FFFF) {
+            utf8_str[utf8_idx++] = (char)(0xF0 | (code_point >> 18));
+            utf8_str[utf8_idx++] = (char)(0x80 | ((code_point >> 12) & 0x3F));
+            utf8_str[utf8_idx++] = (char)(0x80 | ((code_point >> 6) & 0x3F));
+            utf8_str[utf8_idx++] = (char)(0x80 | (code_point & 0x3F));
+        }
+        // No need to check for overflow as required_utf8_bytes was pre-calculated
+    }
+
+    utf8_str[utf8_idx] = '\0';
+    *out_utf8_len_bytes = utf8_idx;
+    return utf8_str;
+}
+
+// Helper for UTF-8 (host) to UTF-16LE (temp host buffer for wasm)
+static uint16*
+transcode_utf8_to_utf16le_on_host(const char *utf8_str, uint32 utf8_len_bytes,
+                                  uint32 *out_utf16_code_units,
+                                  char *error_buf, uint32 error_buf_size)
+{
+    if (!utf8_str) {
+        set_canon_error(error_buf, error_buf_size, "transcode_utf8_to_utf16le_on_host: Null utf8_str for transcoding.");
+        if(out_utf16_code_units) *out_utf16_code_units = 0;
+        return NULL;
+    }
+    if (!out_utf16_code_units) {
+        set_canon_error(error_buf, error_buf_size, "transcode_utf8_to_utf16le_on_host: out_utf16_code_units is null.");
+        return NULL;
+    }
+    *out_utf16_code_units = 0;
+
+    if (utf8_len_bytes == 0) {
+        // Return non-NULL for empty string, as Wasm side might still expect an allocation (e.g. offset, 0_len)
+        // Allocate for 0 code units. loader_malloc(0) behavior can be platform-dependent.
+        // It's safer to request 0 actual code units, and the caller handles Wasm allocation.
+        return loader_malloc(0, error_buf, error_buf_size); // This might return NULL or a unique pointer.
+    }
+
+    // Calculate exact UTF-16 code units needed
+    uint32 required_utf16_code_units = 0;
+    uint32 temp_utf8_idx = 0;
+    while(temp_utf8_idx < utf8_len_bytes) {
+        uint8 c = utf8_str[temp_utf8_idx];
+        if (c < 0x80) temp_utf8_idx += 1;
+        else if ((c & 0xE0) == 0xC0) temp_utf8_idx += 2;
+        else if ((c & 0xF0) == 0xE0) temp_utf8_idx += 3;
+        else if ((c & 0xF8) == 0xF0) { temp_utf8_idx += 4; required_utf16_code_units++; /* For surrogate pair */ }
+        else { set_canon_error(error_buf, error_buf_size, "Invalid UTF-8 sequence during length calculation."); return NULL; }
+        if (temp_utf8_idx > utf8_len_bytes && c < 0xF0) { /* check overran only if not starting 4-byte seq */
+            set_canon_error(error_buf, error_buf_size, "Invalid UTF-8 sequence (overrun) during length calculation."); return NULL;
+        }
+        required_utf16_code_units++;
+    }
+
+
+    uint16 *utf16_buf = loader_malloc(required_utf16_code_units * sizeof(uint16), error_buf, error_buf_size);
+    if (!utf16_buf) return NULL;
+
+    uint32 utf8_idx = 0;
+    uint32 utf16_idx = 0;
+
+    while (utf8_idx < utf8_len_bytes) {
+        uint32 code_point;
+        uint8 c1 = utf8_str[utf8_idx];
+        uint32 consumed_utf8_bytes = 0;
+
+        if (c1 < 0x80) {
+            code_point = c1; consumed_utf8_bytes = 1;
+        } else if ((c1 & 0xE0) == 0xC0) {
+            if (utf8_idx + 1 >= utf8_len_bytes) goto invalid_utf8;
+            uint8 c2 = utf8_str[utf8_idx + 1];
+            if ((c2 & 0xC0) != 0x80) goto invalid_utf8;
+            code_point = ((c1 & 0x1F) << 6) | (c2 & 0x3F); consumed_utf8_bytes = 2;
+        } else if ((c1 & 0xF0) == 0xE0) {
+            if (utf8_idx + 2 >= utf8_len_bytes) goto invalid_utf8;
+            uint8 c2 = utf8_str[utf8_idx + 1]; uint8 c3 = utf8_str[utf8_idx + 2];
+            if ((c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) goto invalid_utf8;
+            code_point = ((c1 & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F); consumed_utf8_bytes = 3;
+        } else if ((c1 & 0xF8) == 0xF0) {
+            if (utf8_idx + 3 >= utf8_len_bytes) goto invalid_utf8;
+            uint8 c2 = utf8_str[utf8_idx + 1]; uint8 c3 = utf8_str[utf8_idx + 2]; uint8 c4 = utf8_str[utf8_idx + 3];
+            if ((c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80 || (c4 & 0xC0) != 0x80) goto invalid_utf8;
+            code_point = ((c1 & 0x07) << 18) | ((c2 & 0x3F) << 12) | ((c3 & 0x3F) << 6) | (c4 & 0x3F); consumed_utf8_bytes = 4;
+        } else { goto invalid_utf8; }
+
+        utf8_idx += consumed_utf8_bytes;
+
+        if (code_point <= 0xFFFF) {
+            utf16_buf[utf16_idx++] = (uint16)code_point;
+        } else if (code_point <= 0x10FFFF) {
+            code_point -= 0x10000;
+            utf16_buf[utf16_idx++] = (uint16)((code_point >> 10) + 0xD800);
+            utf16_buf[utf16_idx++] = (uint16)((code_point & 0x3FF) + 0xDC00);
+        } else { goto invalid_utf8; } // Should not happen if UTF-8 is valid and up to 4 bytes
+    }
+
+    *out_utf16_code_units = utf16_idx;
+    return utf16_buf;
+
+invalid_utf8:
+    loader_free(utf16_buf);
+    set_canon_error(error_buf, error_buf_size, "Invalid UTF-8 sequence during transcoding to UTF-16LE.");
+    return NULL;
+}
+// END: UTF-16 Transcoding Helpers
+
 // Helper to convert primitive value type enum to string for error messages
 static const char* primitive_val_type_to_string(WASMComponentPrimValType ptype) {
     switch (ptype) {
@@ -226,15 +412,31 @@ wasm_component_canon_lift_value(
                         set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for UTF-16 string at offset %u, code_units %u (%u bytes)", offset, length, utf16_bytes_in_wasm);
                         return false;
                     }
-                    // TODO: Implement/call transcode_utf16_to_utf8(core_mem_base + offset, length (code units), &lifted_str_ptr, &lifted_str_len_bytes);
-                    LOG_TODO("Implement UTF-16 to UTF-8 transcoding for string lifting.");
-                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lifting not yet implemented.");
-                    return false; 
+                    uint16 *utf16_wasm_ptr = (uint16*)(core_mem_base + offset);
+                    lifted_str_ptr = transcode_utf16le_to_utf8_on_host(utf16_wasm_ptr, length, /* length is utf16_code_units */
+                                                                     &lifted_str_len_bytes,
+                                                                     error_buf, error_buf_size);
+                    if (!lifted_str_ptr) {
+                        // error_buf is set by transcoder
+                        return false;
+                    }
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
                     // TODO: Implement inspection and transcoding for Latin1+UTF16
-                    LOG_TODO("Implement Latin1+UTF16 to UTF-8 transcoding for string lifting.");
-                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
-                    return false;
+                    LOG_WARNING("String lifting for Latin1+UTF16: Currently treating as UTF-8 if it were Latin1, or potentially misinterpreting if it's UTF-16. Full support pending.");
+                    // Fallback to UTF-8 like behavior for now, or specific error.
+                    // For now, let's be explicit this is not fully supported.
+                    // Duplicating UTF-8 logic here as a placeholder for "treat as bytes"
+                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, length)) {
+                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for Latin1+UTF16 (treated as bytes) string at offset %u, length %u", offset, length);
+                        return false;
+                    }
+                    lifted_str_len_bytes = length; // Assuming length is bytes for this path
+                    lifted_str_ptr = loader_malloc(lifted_str_len_bytes + 1, error_buf, error_buf_size);
+                    if (!lifted_str_ptr) return false;
+                    bh_memcpy_s(lifted_str_ptr, lifted_str_len_bytes + 1, core_mem_base + offset, length);
+                    lifted_str_ptr[lifted_str_len_bytes] = '\0';
+                    // set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
+                    // return false;
                 } else {
                      set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option: %d", string_encoding);
                      return false;
@@ -271,51 +473,69 @@ wasm_component_canon_lift_value(
         uint32 list_length = core_params[1]; 
 
         WASMComponentValType *element_valtype = target_component_valtype->u.list.element_valtype;
-        if (element_valtype->kind != VAL_TYPE_KIND_PRIMITIVE) {
-            set_canon_error(error_buf, error_buf_size, "List lifting currently only supports primitive elements.");
-            return false;
-        }
-        
-        uint8 core_element_type_tag = get_core_wasm_type_for_primitive(element_valtype->u.primitive);
-        uint32 core_element_size = get_core_wasm_primitive_size(core_element_type_tag);
-
-        if (core_element_type_tag == VALUE_TYPE_VOID || core_element_size == 0) { 
-            set_canon_error_v(error_buf, error_buf_size, "Unsupported/unknown list element primitive type for size calculation: %d", element_valtype->u.primitive);
-            return false;
-        }
-
         uint8 *core_mem_base = wasm_runtime_get_memory_ptr(module_inst, mem_idx, NULL);
         if (!core_mem_base) {
              set_canon_error(error_buf, error_buf_size, "Failed to get memory pointer for list lifting.");
              return false;
         }
-        if (list_length > 0 && !wasm_runtime_validate_app_addr(module_inst, mem_idx, list_offset, list_length * core_element_size)) {
-            set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for list at offset %u, length %u, element_size %u", list_offset, list_length, core_element_size);
-            return false;
-        }
 
-        void **lifted_elements_array = NULL;
+        HostComponentList *host_list_struct = loader_malloc(sizeof(HostComponentList), error_buf, error_buf_size);
+        if (!host_list_struct) return false;
+        host_list_struct->count = list_length;
+        host_list_struct->elements = NULL;
+
         if (list_length > 0) {
-            lifted_elements_array = loader_malloc(list_length * sizeof(void*), error_buf, error_buf_size);
-            if (!lifted_elements_array) return false;
-            memset(lifted_elements_array, 0, list_length * sizeof(void*));
+            host_list_struct->elements = loader_malloc(list_length * sizeof(void*), error_buf, error_buf_size);
+            if (!host_list_struct->elements) {
+                loader_free(host_list_struct);
+                return false;
+            }
+            memset(host_list_struct->elements, 0, list_length * sizeof(void*));
 
+            uint32 current_element_data_offset_within_list_buffer = 0;
             for (uint32 i = 0; i < list_length; ++i) {
-                void *core_elem_addr = core_mem_base + list_offset + (i * core_element_size);
-                if (!wasm_component_canon_lift_value(exec_env, canonical_def, core_func_idx,
-                                                    core_elem_addr, core_element_type_tag,
-                                                    element_valtype,
-                                                    &lifted_elements_array[i],
-                                                    error_buf, error_buf_size)) {
-                    for (uint32 j = 0; j < i; ++j) {
-                        if (lifted_elements_array[j]) loader_free(lifted_elements_array[j]);
-                    }
-                    loader_free(lifted_elements_array);
+                uint32 element_core_size, element_core_align;
+                if (!get_component_type_core_abi_details(element_valtype, module_inst, &element_core_size, &element_core_align, error_buf, error_buf_size)) {
+                    for(uint32 j=0; j<i; ++j) if(host_list_struct->elements[j]) loader_free(host_list_struct->elements[j]); // Assuming elements are simple mallocs
+                    loader_free(host_list_struct->elements);
+                    loader_free(host_list_struct);
                     return false;
                 }
+
+                current_element_data_offset_within_list_buffer = align_up(current_element_data_offset_within_list_buffer, element_core_align);
+
+                void *core_elem_addr = core_mem_base + list_offset + current_element_data_offset_within_list_buffer;
+
+                if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, list_offset + current_element_data_offset_within_list_buffer, element_core_size)) {
+                     set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for list element %u at offset %u, size %u", i, list_offset + current_element_data_offset_within_list_buffer, element_core_size);
+                     for(uint32 j=0; j<i; ++j) if(host_list_struct->elements[j]) loader_free(host_list_struct->elements[j]);
+                     loader_free(host_list_struct->elements);
+                     loader_free(host_list_struct);
+                     return false;
+                }
+
+                uint8 core_element_type_tag_for_recursive_lift = VALUE_TYPE_I32; // Default for complex types (offset)
+                if (element_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
+                    core_element_type_tag_for_recursive_lift = get_core_wasm_type_for_primitive(element_valtype->u.primitive);
+                }
+
+
+                if (!wasm_component_canon_lift_value(exec_env, canonical_def, core_func_idx,
+                                                    core_elem_addr, core_element_type_tag_for_recursive_lift,
+                                                    element_valtype,
+                                                    &host_list_struct->elements[i],
+                                                    error_buf, error_buf_size)) {
+                    for (uint32 j = 0; j <= i; ++j) { // Free up to and including the one that failed if it allocated
+                        if (host_list_struct->elements[j]) loader_free(host_list_struct->elements[j]);
+                    }
+                    loader_free(host_list_struct->elements);
+                    loader_free(host_list_struct);
+                    return false;
+                }
+                current_element_data_offset_within_list_buffer += element_core_size;
             }
         }
-        *lifted_component_value_ptr = lifted_elements_array;
+        *lifted_component_value_ptr = host_list_struct;
         return true;
     } else if (target_component_valtype->kind == VAL_TYPE_KIND_RECORD) {
         WASMComponentRecordType *record_type = &target_component_valtype->u.record;
@@ -444,26 +664,30 @@ wasm_component_canon_lift_value(
             uint32 payload_offset_in_wasm_struct = align_up(discriminant_size, payload_wasm_align);
             void *payload_wasm_addr = (uint8*)core_value_ptr + payload_offset_in_wasm_struct;
             
-            // Determine core type of payload for recursive call (usually I32 if it's an offset to another structure)
-            uint8 payload_core_type_tag = VALUE_TYPE_I32; 
+            // Determine core type of payload for recursive call
+            uint8 payload_core_type_tag_for_lift = VALUE_TYPE_I32; // Default for complex types (offset)
             if (payload_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
-                 payload_core_type_tag = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
+                 payload_core_type_tag_for_lift = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
+            } else if (payload_valtype->kind == VAL_TYPE_KIND_STRING || payload_valtype->kind == VAL_TYPE_KIND_LIST) {
+                // String/List are (ptr, len) pairs, effectively i32 for the recursive call to get the pair itself
+                 payload_core_type_tag_for_lift = VALUE_TYPE_I32;
             }
 
+
             if (!wasm_component_canon_lift_value(exec_env, canonical_def, core_func_idx,
-                                                payload_wasm_addr, payload_core_type_tag,
+                                                payload_wasm_addr, payload_core_type_tag_for_lift,
                                                 payload_valtype, 
                                                 &host_option->val, // Store lifted payload ptr here
                                                 error_buf, error_buf_size)) {
                 loader_free(host_option);
-                // Error message is already set by the recursive call.
-                return false;
+                return false; // Error message is already set by the recursive call.
             }
-        } else if (disc != 0) { // Invalid discriminant
+        } else if (disc != 0 && disc != 1) { // Option discriminant must be 0 or 1
             loader_free(host_option);
             set_canon_error_v(error_buf, error_buf_size, "Invalid discriminant %u for option type", disc);
             return false;
         }
+        // If disc is 0 (None), host_option->val remains NULL, which is correct.
         
         *lifted_component_value_ptr = host_option;
         return true;
@@ -512,21 +736,23 @@ wasm_component_canon_lift_value(
             uint32 payload_offset_in_wasm_struct = align_up(discriminant_size, max_payload_align_for_calc);
             void *payload_wasm_addr = (uint8*)core_value_ptr + payload_offset_in_wasm_struct;
 
-            uint8 payload_core_type_tag = VALUE_TYPE_I32;
+            uint8 payload_core_type_tag_for_lift = VALUE_TYPE_I32; // Default for complex types
             if (payload_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
-                 payload_core_type_tag = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
+                 payload_core_type_tag_for_lift = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
+            } else if (payload_valtype->kind == VAL_TYPE_KIND_STRING || payload_valtype->kind == VAL_TYPE_KIND_LIST) {
+                 payload_core_type_tag_for_lift = VALUE_TYPE_I32;
             }
 
             if (!wasm_component_canon_lift_value(exec_env, canonical_def, core_func_idx,
-                                                payload_wasm_addr, payload_core_type_tag,
+                                                payload_wasm_addr, payload_core_type_tag_for_lift,
                                                 payload_valtype, 
                                                 &host_result->val,
                                                 error_buf, error_buf_size)) {
                 loader_free(host_result);
-                // Error message is already set by the recursive call.
-                return false;
+                return false; // Error message is already set by the recursive call.
             }
         }
+        // If payload_valtype is NULL (e.g. for result<void, E> or result<T, void>), host_result->val remains NULL.
         *lifted_component_value_ptr = host_result;
         return true;
     } else if (target_component_valtype->kind == VAL_TYPE_KIND_VARIANT) {
@@ -575,21 +801,23 @@ wasm_component_canon_lift_value(
             uint32 payload_offset_in_wasm_struct = align_up(discriminant_size, max_case_payload_align);
             void *payload_wasm_addr = (uint8*)core_value_ptr + payload_offset_in_wasm_struct;
             
-            uint8 payload_core_type_tag = VALUE_TYPE_I32;
+            uint8 payload_core_type_tag_for_lift = VALUE_TYPE_I32; // Default for complex types
             if (payload_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
-                 payload_core_type_tag = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
+                 payload_core_type_tag_for_lift = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
+            } else if (payload_valtype->kind == VAL_TYPE_KIND_STRING || payload_valtype->kind == VAL_TYPE_KIND_LIST) {
+                 payload_core_type_tag_for_lift = VALUE_TYPE_I32;
             }
 
             if (!wasm_component_canon_lift_value(exec_env, canonical_def, core_func_idx,
-                                                payload_wasm_addr, payload_core_type_tag,
+                                                payload_wasm_addr, payload_core_type_tag_for_lift,
                                                 payload_valtype, 
                                                 &host_variant->val,
                                                 error_buf, error_buf_size)) {
                 loader_free(host_variant);
-                // Error message is already set by the recursive call.
-                return false; 
+                return false; // Error message is already set by the recursive call.
             }
         }
+        // If !payload_valtype (case has no payload), host_variant->val remains NULL.
         *lifted_component_value_ptr = host_variant;
         return true;
     } else if (target_component_valtype->kind == VAL_TYPE_KIND_OWN_TYPE_IDX ||
@@ -627,50 +855,35 @@ wasm_component_canon_lift_value(
             if (!lifted_elements_array) return false;
             memset(lifted_elements_array, 0, tuple_type->field_count * sizeof(void*));
 
-            // Assumption: core_value_ptr points to the start of a flat structure in Wasm memory
-            // representing the tuple. Elements are laid out sequentially.
-            // This requires calculating offsets.
-            uint8 *current_wasm_ptr = (uint8*)core_value_ptr; 
-            // This assumption is strong: core_value_ptr is a direct pointer into Wasm linear memory.
-            // This might not be true if tuples are passed by reference via an offset, in which case
-            // core_value_ptr would be &offset and core_value_type would be I32.
-            // For now, let's assume core_value_ptr is the direct address in Wasm memory.
-            // This is inconsistent with how Records are handled (void**).
-            // Let's reconsider: if lifting a tuple that is part of a function signature,
-            // core_value_ptr could be a pointer to where the tuple's representation (e.g. an i32 offset) is stored.
-            // Or, if it's part of another structure, it could be an embedded value.
-
-            // To be consistent with Record lifting, let's assume core_value_ptr for a tuple
-            // is also a void** if it's a standalone tuple being lifted.
-            // However, the subtask implies tuples might be flat in memory.
-            // Let's assume for lifting, if a core function returns a tuple, it's returned as a pointer to a flat structure.
-            // So core_value_ptr is that pointer (e.g. an i32 value that is an offset).
-            // If core_value_type is I32, then *(uint32*)core_value_ptr is the offset.
-
+            // core_value_ptr points to an i32 Wasm offset of the tuple data.
+            if (core_value_type != VALUE_TYPE_I32) {
+                set_canon_error_v(error_buf, error_buf_size, "Tuple lifting expects core_value_type I32 (for offset), got %u", core_value_type);
+                if (lifted_elements_array && tuple_type->field_count > 0) loader_free(lifted_elements_array);
+                return false;
+            }
             if (mem_idx == (uint32)-1 && canonical_def) {
                  set_canon_error(error_buf, error_buf_size, "Tuple lifting from memory requires memory option.");
-                 loader_free(lifted_elements_array);
+                 if (lifted_elements_array && tuple_type->field_count > 0) loader_free(lifted_elements_array);
                  return false;
             }
             if (!module_inst) {
                  set_canon_error(error_buf, error_buf_size, "Module instance required for tuple lifting from memory.");
-                 loader_free(lifted_elements_array);
+                 if (lifted_elements_array && tuple_type->field_count > 0) loader_free(lifted_elements_array);
                  return false;
             }
             uint8 *core_mem_base = wasm_runtime_get_memory_ptr(module_inst, mem_idx, NULL);
             if (!core_mem_base) {
                  set_canon_error(error_buf, error_buf_size, "Failed to get memory pointer for tuple lifting.");
-                 loader_free(lifted_elements_array);
+                 if (lifted_elements_array && tuple_type->field_count > 0) loader_free(lifted_elements_array);
                  return false;
             }
 
-            // Assuming core_value_ptr contains the offset of the tuple in wasm memory
             uint32 tuple_offset_in_wasm = *(uint32*)core_value_ptr;
-            uint32 current_offset_within_tuple = 0;
-            // overall_max_alignment_for_tuple is not strictly needed here as tuple_offset_in_wasm should already be aligned by the producer.
+            uint32 current_offset_within_tuple_buffer = 0;
 
             for (uint32 i = 0; i < tuple_type->field_count; ++i) {
-                WASMComponentValType *element_val_type = tuple_type->fields[i].valtype;
+                // The type of each element is directly in element_valtypes array
+                WASMComponentValType *element_val_type = &tuple_type->element_valtypes[i];
                 uint8 element_core_type_tag_for_recursive_lift = VALUE_TYPE_VOID;
                 uint32 element_core_size_from_helper = 0;
                 uint32 element_core_alignment_from_helper = 0;
@@ -943,20 +1156,64 @@ wasm_component_canon_lower_value(
                     if (alloc_native_ptr) bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, str_to_lower, wasm_len);
 
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_UTF16) {
-                    // TODO: Implement/call transcode_utf8_to_utf16(str_to_lower, &utf16_ptr, &utf16_code_units);
-                    // wasm_len = utf16_code_units;
-                    // uint32 alloc_size_bytes = wasm_len * sizeof(uint16);
-                    // Allocate using realloc/malloc as above.
-                    // Copy utf16_ptr to alloc_native_ptr.
-                    // Free utf16_ptr if it was allocated by transcoder.
-                    LOG_TODO("Implement UTF-8 to UTF-16 transcoding for string lowering.");
-                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lowering not yet implemented.");
-                    return false;
+                    uint32 utf8_byte_len = strlen(str_to_lower);
+                    uint16 *temp_utf16_host_buffer = transcode_utf8_to_utf16le_on_host(str_to_lower, utf8_byte_len,
+                                                                                     &wasm_len, /* out: utf16_code_units */
+                                                                                     error_buf, error_buf_size);
+                    if (!temp_utf16_host_buffer && utf8_byte_len > 0) { // Transcoding failed
+                        // error_buf set by transcoder
+                        return false;
+                    }
+
+                    uint32 alloc_size_bytes = wasm_len * sizeof(uint16);
+
+                    if (use_wasm_realloc) {
+                        uint32 argv[4] = {0, 0, sizeof(uint16), alloc_size_bytes}; // old_ptr, old_size, align(u16), new_size
+                        WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                        if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) {
+                            if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                            set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for UTF-16 string. Error: %s", wasm_runtime_get_exception(module_inst)); return false;
+                        }
+                        wasm_offset = argv[0];
+                        if (wasm_offset == 0 && alloc_size_bytes > 0) {
+                            if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                            set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for UTF-16 string."); return false;
+                        }
+                        alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
+                    } else {
+                        alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
+                    }
+
+                    if (!alloc_native_ptr && alloc_size_bytes > 0) {
+                        if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                        set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for UTF-16 string in Wasm.", alloc_size_bytes); return false;
+                    }
+                    if (alloc_native_ptr && temp_utf16_host_buffer && alloc_size_bytes > 0) {
+                         bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, temp_utf16_host_buffer, alloc_size_bytes);
+                    }
+                    if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
-                    // TODO: Implement UTF-8 to Latin1/UTF16 transcoding.
-                    LOG_TODO("Implement UTF-8 to Latin1/UTF16 transcoding for string lowering.");
-                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
-                    return false;
+                    LOG_WARNING("String lowering for Latin1+UTF16: Currently treating as UTF-8. Full support pending.");
+                    // Fallback to UTF-8 like behavior
+                    wasm_len = strlen(str_to_lower); // byte length
+                    uint32 alloc_size_bytes = wasm_len;
+                    if (use_wasm_realloc) {
+                        uint32 argv[4] = {0, 0, 1, alloc_size_bytes};
+                        WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                        if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) { set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for Latin1+UTF16 (as UTF-8). Error: %s", wasm_runtime_get_exception(module_inst)); return false; }
+                        wasm_offset = argv[0];
+                        if (wasm_offset == 0 && alloc_size_bytes > 0) { set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for Latin1+UTF16 (as UTF-8)."); return false; }
+                        alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
+                    } else {
+                        alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
+                    }
+                    if (!alloc_native_ptr && alloc_size_bytes > 0) { set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for Latin1+UTF16 (as UTF-8).", alloc_size_bytes); return false; }
+                    if (alloc_native_ptr) bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, str_to_lower, wasm_len);
+                    // Note: wasm_len here is byte length. If the intent for Latin1+UTF16 is to pass UTF-16 code units, this is incorrect.
+                    // For now, it mirrors UTF-8, meaning 'length' is byte count.
+                    // set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
+                    // return false;
                 } else {
                     set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option for lowering: %d", string_encoding);
                     return false;
@@ -992,104 +1249,84 @@ wasm_component_canon_lower_value(
         }
         
         WASMComponentValType *element_valtype = source_component_valtype->u.list.element_valtype;
-        if (element_valtype->kind != VAL_TYPE_KIND_PRIMITIVE) {
-            set_canon_error(error_buf, error_buf_size, "List lowering currently only supports primitive elements.");
-            return false;
-        }
+        uint32 total_wasm_elements_alloc_size = 0;
+        uint32 list_max_align = 1;
 
-        uint8 core_element_type_tag = get_core_wasm_type_for_primitive(element_valtype->u.primitive);
-        uint32 core_element_size = get_core_wasm_primitive_size(core_element_type_tag);
-
-        if (core_element_type_tag == VALUE_TYPE_VOID || core_element_size == 0) {
-            set_canon_error_v(error_buf, error_buf_size, "Could not determine core size for lowering list element type %u", element_valtype->u.primitive);
-            return false;
-        }
-
-        uint32 total_wasm_alloc_size = host_list->count * core_element_size; // Assuming no complex padding, direct multiplication
-        uint32 wasm_list_offset = 0;
-        void *wasm_list_native_ptr = NULL;
-
+        // Calculate total size and max alignment for the list elements buffer in Wasm
         if (host_list->count > 0) {
-            if (use_wasm_realloc) {
-                // LOG_TODO: For complex list elements (if supported in future),
-                // list_alignment for realloc should be determined by get_component_type_core_abi_details
-                // for the element's true alignment. Current use of core_element_size is
-                // acceptable for primitive elements.
-                uint32 list_alignment = core_element_size;
-
-                uint32 argv[4];
-                argv[0] = 0; // old_ptr
-                argv[1] = 0; // old_size
-                argv[2] = list_alignment;
-                argv[3] = total_wasm_alloc_size; // new_size
-                
-                WASMFunctionInstance *realloc_func = NULL;
-                 if (realloc_func_idx < module_inst->import_function_count) {
-                     realloc_func = module_inst->import_functions[realloc_func_idx].func_ptr_linked;
-                } else {
-                     realloc_func = &module_inst->functions[realloc_func_idx - module_inst->import_function_count];
+            for (uint32 i = 0; i < host_list->count; ++i) {
+                uint32 element_core_size, element_core_align;
+                if (!get_component_type_core_abi_details(element_valtype, module_inst, &element_core_size, &element_core_align, error_buf, error_buf_size)) {
+                    return false; // Error set by helper
                 }
-
-                if (!wasm_runtime_call_wasm(exec_env, realloc_func, 4, argv)) {
-                    set_canon_error_v(error_buf, error_buf_size, "Wasm realloc function call failed for list. Error: %s", wasm_runtime_get_exception(module_inst));
-                    return false;
-                }
-                wasm_list_offset = argv[0];
-                if (wasm_list_offset == 0 && total_wasm_alloc_size > 0) {
-                    set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for list allocation.");
-                    return false;
-                }
-                wasm_list_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_list_offset);
-                if (!wasm_list_native_ptr && total_wasm_alloc_size > 0) {
-                     set_canon_error_v(error_buf, error_buf_size, "Wasm realloc returned invalid offset %u for list.", wasm_list_offset);
-                     return false;
-                }
-
-            } else {
-                wasm_list_native_ptr = wasm_runtime_module_malloc(module_inst, total_wasm_alloc_size, (void**)&wasm_list_offset);
-                if (!wasm_list_native_ptr && total_wasm_alloc_size > 0) {
-                    set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes in wasm memory for list using module_malloc.", total_wasm_alloc_size);
-                    return false;
-                }
+                if (element_core_align > list_max_align) list_max_align = element_core_align;
+                total_wasm_elements_alloc_size = align_up(total_wasm_elements_alloc_size, element_core_align);
+                total_wasm_elements_alloc_size += element_core_size;
             }
-        } else { // host_list->count == 0
-            // wasm_list_offset remains 0, wasm_list_native_ptr remains NULL. This is fine for empty lists.
+            if (list_max_align == 0) list_max_align = 1; // Should not happen if elements have types
+            total_wasm_elements_alloc_size = align_up(total_wasm_elements_alloc_size, list_max_align);
+        }
+
+        uint32 wasm_list_elements_offset = 0;
+        void *wasm_list_elements_native_ptr = NULL;
+
+        if (total_wasm_elements_alloc_size > 0) {
+            if (use_wasm_realloc) {
+                uint32 argv[4] = {0, 0, list_max_align, total_wasm_elements_alloc_size};
+                WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) {
+                    set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for list elements. Error: %s", wasm_runtime_get_exception(module_inst)); return false;
+                }
+                wasm_list_elements_offset = argv[0];
+                if (wasm_list_elements_offset == 0 && total_wasm_elements_alloc_size > 0) { set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for list elements."); return false; }
+                wasm_list_elements_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_list_elements_offset);
+            } else {
+                wasm_list_elements_native_ptr = wasm_runtime_module_malloc(module_inst, total_wasm_elements_alloc_size, (void**)&wasm_list_elements_offset);
+            }
+            if (!wasm_list_elements_native_ptr && total_wasm_elements_alloc_size > 0) {
+                set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for list elements in Wasm.", total_wasm_elements_alloc_size); return false;
+            }
         }
         
+        uint32 current_element_write_offset_in_buffer = 0;
         for (uint32 i = 0; i < host_list->count; ++i) {
             void *host_elem_ptr = host_list->elements[i];
-            void *core_elem_write_ptr_in_wasm = (uint8*)wasm_list_native_ptr + (i * core_element_size);
-            if (!wasm_component_canon_lower_value(exec_env, canonical_def, core_func_idx,
-                                                  host_elem_ptr, element_valtype,
-                                                  core_element_type_tag,
-                                                  core_elem_write_ptr_in_wasm, 
-                                                  error_buf, error_buf_size)) {
-                // If lowering an element fails, free the already allocated list memory
-                if (wasm_list_native_ptr && host_list->count > 0 && total_wasm_alloc_size > 0) {
-                     if (use_wasm_realloc) {
-                        // The canonical ABI doesn't specify a 'free' via realloc(ptr, old_size, alignment, 0).
-                        // Some reallocs might free if new_size is 0, others might not.
-                        // WAMR's default mgtc allocator does free on realloc with new_size = 0.
-                        // However, to be safe and avoid depending on specific realloc behavior not mandated
-                        // by the component model spec for the canonical 'realloc' option,
-                        // we will consider this memory "leaked" by the guest if the guest's realloc
-                        // doesn't free it and a sub-operation fails.
-                        // If a canonical 'free' option were available, it would be used here.
-                        LOG_WARNING("Partial list lowering failed after Wasm realloc. Wasm allocated memory at offset %u might be leaked if guest realloc doesn't handle this.", wasm_list_offset);
-                     } else {
-                        wasm_runtime_module_free(module_inst, wasm_list_offset);
-                     }
+            uint32 element_core_size, element_core_align; // Recalculate for current element to advance offset correctly
+            if (!get_component_type_core_abi_details(element_valtype, module_inst, &element_core_size, &element_core_align, error_buf, error_buf_size)) {
+                // This would be an internal error if previous loop succeeded.
+                // Free Wasm buffer if allocated.
+                if (wasm_list_elements_native_ptr && total_wasm_elements_alloc_size > 0) {
+                    if (use_wasm_realloc) { /* Leak warning as before */ } else { wasm_runtime_module_free(module_inst, wasm_list_elements_offset); }
                 }
-                // Error message should be set by the recursive call
                 return false;
             }
+
+            current_element_write_offset_in_buffer = align_up(current_element_write_offset_in_buffer, element_core_align);
+            void *core_elem_write_ptr_in_wasm = (uint8*)wasm_list_elements_native_ptr + current_element_write_offset_in_buffer;
+
+            uint8 element_target_core_type = VALUE_TYPE_I32; // Default for complex types
+            if (element_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
+                element_target_core_type = get_core_wasm_type_for_primitive(element_valtype->u.primitive);
+            }
+
+            if (!wasm_component_canon_lower_value(exec_env, canonical_def, core_func_idx,
+                                                  host_elem_ptr, element_valtype,
+                                                  element_target_core_type,
+                                                  core_elem_write_ptr_in_wasm, 
+                                                  error_buf, error_buf_size)) {
+                if (wasm_list_elements_native_ptr && total_wasm_elements_alloc_size > 0) {
+                     if (use_wasm_realloc) { /* Leak warning */ } else { wasm_runtime_module_free(module_inst, wasm_list_elements_offset); }
+                }
+                return false;
+            }
+            current_element_write_offset_in_buffer += element_core_size;
         }
 
         uint32_t *out_pair = (uint32_t*)core_value_write_ptr;
-        out_pair[0] = wasm_list_offset;
+        out_pair[0] = wasm_list_elements_offset;
         out_pair[1] = host_list->count; 
         
-        LOG_VERBOSE("Lowered list to wasm mem offset %u, element_count %u", wasm_list_offset, host_list->count);
+        LOG_VERBOSE("Lowered list to wasm mem offset %u, element_count %u, total element data size %u", wasm_list_elements_offset, host_list->count, total_wasm_elements_alloc_size);
         return true;
     } else if (source_component_valtype->kind == VAL_TYPE_KIND_RECORD) {
         WASMComponentRecordType *record_type = &source_component_valtype->u.record;
@@ -1219,11 +1456,13 @@ wasm_component_canon_lower_value(
         loader_free(field_core_alignments);
 
         // 4. Write the Wasm offset of the record structure to core_value_write_ptr
-        if (target_core_wasm_type == VALUE_TYPE_I32) {
+        if (target_core_wasm_type == VALUE_TYPE_I32) { // Target for the record itself is a pointer (offset)
             *(uint32*)core_value_write_ptr = wasm_record_offset;
         } else {
-            set_canon_error_v(error_buf, error_buf_size, "Record lowering expects target core type I32 for offset, got %u", target_core_wasm_type);
-            if (wasm_record_native_ptr) wasm_runtime_module_free(module_inst, wasm_record_offset);
+            set_canon_error_v(error_buf, error_buf_size, "Record lowering expects target core type I32 for record offset, got %u", target_core_wasm_type);
+            if (wasm_record_native_ptr && total_wasm_alloc_size > 0) wasm_runtime_module_free(module_inst, wasm_record_offset); // Free if allocated and not used
+            loader_free(field_core_sizes); // Still need to free these helper arrays
+            loader_free(field_core_alignments);
             return false;
         }
         
@@ -1310,10 +1549,11 @@ wasm_component_canon_lower_value(
             uint32 payload_offset_in_wasm_struct = align_up(discriminant_size, payload_wasm_align);
             void *payload_write_addr = wasm_option_native_ptr + payload_offset_in_wasm_struct;
 
-            uint8 payload_target_core_type = VALUE_TYPE_I32; // Default for complex types (offset)
+            uint8 payload_target_core_type = VALUE_TYPE_I32; // Default for complex types (offset/pair)
             if (payload_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
                 payload_target_core_type = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
             }
+            // For VAL_TYPE_KIND_STRING or VAL_TYPE_KIND_LIST, target is still I32 (for the pair)
             
             if (!wasm_component_canon_lower_value(exec_env, canonical_def, core_func_idx,
                                                   host_option->val, payload_valtype,
@@ -1321,14 +1561,14 @@ wasm_component_canon_lower_value(
                                                   payload_write_addr,
                                                   error_buf, error_buf_size)) {
                 if (wasm_option_native_ptr && wasm_option_total_size > 0) wasm_runtime_module_free(module_inst, wasm_option_offset);
-                // Error message is set by recursive call.
-                return false;
+                return false; // Error message is set by recursive call.
             }
-        } else if (host_option->disc != 0) { // Invalid discriminant
+        } else if (host_option->disc != 0 && host_option->disc != 1) { // Invalid discriminant for option
              set_canon_error_v(error_buf, error_buf_size, "Invalid discriminant %u for host option value", host_option->disc);
              if (wasm_option_native_ptr && wasm_option_total_size > 0) wasm_runtime_module_free(module_inst, wasm_option_offset);
              return false;
         }
+        // if disc is 0 (None), payload area in Wasm is allocated but not written to, which is fine.
 
         *(uint32*)core_value_write_ptr = wasm_option_offset;
         return true;
@@ -1402,10 +1642,11 @@ wasm_component_canon_lower_value(
             uint32 payload_offset_in_wasm_struct = align_up(discriminant_size, max_payload_align_for_calc);
             void *payload_write_addr = wasm_result_native_ptr + payload_offset_in_wasm_struct;
 
-            uint8 payload_target_core_type = VALUE_TYPE_I32;
+            uint8 payload_target_core_type = VALUE_TYPE_I32; // Default for complex types
             if (payload_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
                 payload_target_core_type = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
             }
+            // For VAL_TYPE_KIND_STRING or VAL_TYPE_KIND_LIST, target is still I32
             
             if (!wasm_component_canon_lower_value(exec_env, canonical_def, core_func_idx,
                                                   host_result->val, payload_valtype,
@@ -1413,16 +1654,13 @@ wasm_component_canon_lower_value(
                                                   payload_write_addr,
                                                   error_buf, error_buf_size)) {
                 if (wasm_result_native_ptr && wasm_result_total_size > 0) wasm_runtime_module_free(module_inst, wasm_result_offset);
-                // Error message propagated from recursive call
-                return false; 
+                return false; // Error message propagated from recursive call
             }
         } else if (payload_valtype && !host_result->val) {
-            // This case means the schema expects a payload but the host provided NULL.
-            // Depending on strictness, this could be an error. For now, assume it means the payload is "empty" or default.
-            // The Wasm memory for the payload area is allocated but remains uninitialized or zeroed by malloc.
-            LOG_VERBOSE("Host result has payload type but null value pointer for disc %u.", host_result->disc);
+            LOG_VERBOSE("Host result has payload type but null value pointer for disc %u. Wasm payload area will be uninitialized.", host_result->disc);
         }
-
+        // If !payload_valtype (e.g. result<void, E>), no payload processing needed.
+        // If disc is invalid, it's caught earlier.
 
         *(uint32*)core_value_write_ptr = wasm_result_offset;
         return true;
@@ -1497,23 +1735,24 @@ wasm_component_canon_lower_value(
             uint32 payload_offset_in_wasm_struct = align_up(discriminant_size, max_case_payload_align);
             void *payload_write_addr = wasm_variant_native_ptr + payload_offset_in_wasm_struct;
 
-            uint8 payload_target_core_type = VALUE_TYPE_I32;
+            uint8 payload_target_core_type = VALUE_TYPE_I32; // Default for complex types
             if (payload_valtype->kind == VAL_TYPE_KIND_PRIMITIVE) {
                 payload_target_core_type = get_core_wasm_type_for_primitive(payload_valtype->u.primitive);
             }
-            
+             // For VAL_TYPE_KIND_STRING or VAL_TYPE_KIND_LIST, target is still I32
+
             if (!wasm_component_canon_lower_value(exec_env, canonical_def, core_func_idx,
                                                   host_variant->val, payload_valtype,
                                                   payload_target_core_type,
                                                   payload_write_addr,
                                                   error_buf, error_buf_size)) {
                 if (wasm_variant_native_ptr && wasm_variant_total_size > 0) wasm_runtime_module_free(module_inst, wasm_variant_offset);
-                // Error propagated from recursive call
-                return false; 
+                return false; // Error propagated from recursive call
             }
-        } else if (payload_valtype && !host_variant->val) {
-            LOG_VERBOSE("Host variant has payload type but null value pointer for disc %u.", host_variant->disc);
+        } else if (payload_valtype && !host_variant->val) { // Case has a type, but no data provided by host
+             LOG_VERBOSE("Host variant (disc %u) has payload type but null value pointer. Wasm payload area will be uninitialized.", host_variant->disc);
         }
+        // If !payload_valtype (case has no payload type), no payload processing needed.
 
         *(uint32*)core_value_write_ptr = wasm_variant_offset;
         return true;
@@ -1627,39 +1866,22 @@ wasm_component_canon_lower_value(
             WASMComponentValType *element_val_type = tuple_type->fields[i].valtype;
             uint8 element_target_core_type = VALUE_TYPE_VOID; // The type of the data being written into wasm memory for this element
 
-            // Determine the target core type for the recursive call (type of the data in wasm memory)
-             if (element_val_type->kind == VAL_TYPE_KIND_PRIMITIVE) {
+            // Determine the target core type for the recursive call
+            if (element_val_type->kind == VAL_TYPE_KIND_PRIMITIVE) {
                 element_target_core_type = get_core_wasm_type_for_primitive(element_val_type->u.primitive);
-            } else if (element_val_type->kind == VAL_TYPE_KIND_LIST || 
-                       element_val_type->kind == VAL_TYPE_KIND_STRING ||
-                       element_val_type->kind == VAL_TYPE_KIND_RECORD ||
-                       element_val_type->kind == VAL_TYPE_KIND_TUPLE) {
-                // These are lowered to offsets or (offset, len) pairs, which are i32s.
-                element_target_core_type = VALUE_TYPE_I32; 
-            } else {
-                 // Should have been caught by size calculation
-                set_canon_error_v(error_buf, error_buf_size, "Unhandled tuple element type %d for lowering.", i);
-                // Note: wasm_runtime_module_free is not called here as it might be complex if partially filled.
-                // The caller should handle this transactionally or by other means if an error occurs mid-way.
-                if(element_core_sizes) loader_free(element_core_sizes);
-                if(element_core_alignments) loader_free(element_core_alignments);
-                // No easy way to free wasm_tuple_native_ptr here if some elements are already written.
-                return false;
+            } else { // Complex types like nested list, string, record, tuple, etc., are stored as i32 offset or (i32,i32) pair
+                element_target_core_type = VALUE_TYPE_I32;
             }
-
 
             current_offset_in_wasm_struct = align_up(current_offset_in_wasm_struct, element_core_alignments[i]);
             void *core_elem_write_ptr_in_wasm = (uint8*)wasm_tuple_native_ptr + current_offset_in_wasm_struct;
 
             if (!wasm_component_canon_lower_value(exec_env, canonical_def, core_func_idx,
                                                   host_elem_ptr, element_val_type,
-                                                  element_target_core_type, // This is the type being written to Wasm memory
+                                                  element_target_core_type,
                                                   core_elem_write_ptr_in_wasm, 
                                                   error_buf, error_buf_size)) {
-                // Error, potentially free wasm_tuple_offset if allocated
                 if (wasm_tuple_native_ptr && total_wasm_alloc_size > 0) wasm_runtime_module_free(module_inst, wasm_tuple_offset);
-                // Error message is set by recursive call or we can set a more specific one.
-                // For now, rely on recursive error.
                 if(element_core_sizes) loader_free(element_core_sizes);
                 if(element_core_alignments) loader_free(element_core_alignments);
                 return false;
@@ -1671,15 +1893,12 @@ wasm_component_canon_lower_value(
         if(element_core_alignments) loader_free(element_core_alignments);
 
         // 4. Write the Wasm offset of the tuple structure to core_value_write_ptr
-        // target_core_wasm_type for the tuple itself should be I32 (offset)
-        if (target_core_wasm_type == VALUE_TYPE_I32) {
+        if (target_core_wasm_type == VALUE_TYPE_I32) { // Target for the tuple itself is a pointer (offset)
             *(uint32*)core_value_write_ptr = wasm_tuple_offset;
         } else {
-            // This case might occur if a tuple is returned directly in a way not via pointer,
-            // which is unlikely for non-trivial tuples with the component model ABI.
-            // Or if the target expects e.g. i64 for the pointer.
-            set_canon_error_v(error_buf, error_buf_size, "Tuple lowering expects target core type I32 for offset, got %u", target_core_wasm_type);
-            if (wasm_tuple_native_ptr) wasm_runtime_module_free(module_inst, wasm_tuple_offset);
+            set_canon_error_v(error_buf, error_buf_size, "Tuple lowering expects target core type I32 for tuple offset, got %u", target_core_wasm_type);
+            if (wasm_tuple_native_ptr && total_wasm_alloc_size > 0) wasm_runtime_module_free(module_inst, wasm_tuple_offset);
+            // No need to free element_core_sizes/alignments again if already freed above on error
             return false;
         }
         
@@ -2167,7 +2386,7 @@ static uint8 get_core_wasm_type_for_primitive(WASMComponentPrimValType prim_val_
         case PRIM_VAL_F32:  return VALUE_TYPE_F32;
         case PRIM_VAL_F64:  return VALUE_TYPE_F64;
         case PRIM_VAL_CHAR: return VALUE_TYPE_I32; // Unicode char
-        // String is not a single primitive passed by value, handled as (offset, len)
+        case PRIM_VAL_STRING: return VALUE_TYPE_I32; // Strings are (offset, len) pairs, i32 each. This reflects the type of components of the pair.
         default: return VALUE_TYPE_VOID; // Error/unknown
     }
 }

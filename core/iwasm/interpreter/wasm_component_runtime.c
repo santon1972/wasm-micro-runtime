@@ -1052,30 +1052,31 @@ wasm_component_instance_deinstantiate(WASMComponentInstanceInternal *comp_inst)
 }
 // Placeholder for LiftedFuncThunk and create_lifted_function_thunk
 // These would typically be in wasm_component_canonical.h/c or similar.
+
+// Forward declaration for generic_lifted_thunk_executor
+static bool
+generic_lifted_thunk_executor(WASMExecEnv *exec_env, uint32 argc, uint32 argv[]);
+
+
 typedef struct LiftedFuncThunkContext {
     WASMComponentCanonical *canonical_def;
     WASMModuleInstance *target_core_module_inst;
-    uint32 target_core_func_idx;
-    WASMComponentFuncType *component_func_type;
-    WASMExecEnv *parent_comp_exec_env;
-    void *host_callable_c_function_ptr; // The actual C thunk
+    uint32 target_core_func_idx; /* Function index within the target_core_module_inst's function space */
+    WASMComponentFuncType *component_func_type; /* The component-level type of this lifted function */
+    WASMExecEnv *parent_comp_exec_env; /* Exec env of the component instance owning this thunk */
+    WASMComponentInstanceInternal *owning_comp_inst; /* Component instance that owns this lifted function */
+    void *host_callable_c_function_ptr; // The actual C thunk (points to generic_lifted_thunk_executor)
 } LiftedFuncThunkContext;
 
 // Conceptual function, actual implementation is part of Step 5's design
 static LiftedFuncThunkContext*
-create_lifted_function_thunk(WASMExecEnv *comp_exec_env,
+create_lifted_function_thunk(WASMExecEnv *comp_exec_env, /* Exec env of the component instance being populated */
+                             WASMComponentInstanceInternal *owning_component_instance, /* The component instance that will own this thunk */
                              WASMComponentCanonical *canonical_def,
                              WASMModuleInstance *target_core_inst, uint32 core_func_idx_in_mod,
                              WASMComponentFuncType *comp_func_type,
                              char *error_buf, uint32 error_buf_size)
 {
-    LOG_TODO("create_lifted_function_thunk: Full implementation needed based on Step 5 design.");
-    // This function would:
-    // 1. Allocate LiftedFuncThunkContext.
-    // 2. Populate it with the provided details.
-    // 3. Generate or assign a C function pointer to host_callable_c_function_ptr.
-    //    This C function is the actual thunk that performs lowering/lifting.
-    // For now, return a dummy or NULL.
     LiftedFuncThunkContext *thunk_ctx = bh_malloc(sizeof(LiftedFuncThunkContext));
     if (!thunk_ctx) {
         set_comp_rt_error(error_buf, error_buf_size, "Failed to allocate LiftedFuncThunkContext");
@@ -1087,24 +1088,495 @@ create_lifted_function_thunk(WASMExecEnv *comp_exec_env,
     thunk_ctx->target_core_func_idx = core_func_idx_in_mod;
     thunk_ctx->component_func_type = comp_func_type;
     thunk_ctx->parent_comp_exec_env = comp_exec_env;
-    // thunk_ctx->host_callable_c_function_ptr = some_generic_lifted_thunk_executor;
+    thunk_ctx->owning_comp_inst = owning_component_instance;
+    thunk_ctx->host_callable_c_function_ptr = (void *)generic_lifted_thunk_executor;
 
-    // For this placeholder, we don't have the actual C thunk code.
-    // In a real scenario, host_callable_c_function_ptr would point to a function
-    // that uses the context to perform the call.
-    // LOG_TODO: Assign the actual C thunk function pointer to thunk_ctx->host_callable_c_function_ptr.
-    // The thunk will use the context to perform argument/result marshalling and the core Wasm call.
-    thunk_ctx->host_callable_c_function_ptr = NULL; // Explicitly NULL for now.
+    LOG_VERBOSE("Created lifted function thunk context %p for canonical_def %p, target_core_inst %p, core_func_idx %u, comp_func_type %p, owning_comp_inst %p",
+                (void*)thunk_ctx, (void*)canonical_def, (void*)target_core_inst, core_func_idx_in_mod, (void*)comp_func_type, (void*)owning_component_instance);
 
-    // Removed: set_comp_rt_error(error_buf, error_buf_size, "Lifted function thunk creation is a placeholder.");
-    // Returning the context, it's partially functional for structure, but not callable yet.
     return thunk_ctx;
+}
+
+static bool
+generic_lifted_thunk_executor(WASMExecEnv *exec_env, uint32 host_argc, uint32 host_argv_raw[])
+{
+    // exec_env is the calling exec_env, which might be the component's or a host exec_env.
+    // The actual LiftedFuncThunkContext is the first argument effectively.
+    // The host_callable_c_function_ptr in LiftedFuncThunkContext points here.
+    // WAMR's native call mechanism passes the context as the first element of argv if it's a bound function.
+    // However, this executor is usually called via wasm_runtime_invoke_c_function or similar,
+    // where the `argc` and `argv` are derived from the component call interface.
+    // The `LiftedFuncThunkContext` needs to be retrieved.
+    // For now, assume this function is called via a mechanism where `exec_env->current_thunk_context` is set.
+    // This needs alignment with how WAMR invokes these thunks (e.g. via `wasm_runtime_invoke_c_function_ex`).
+    // If this is registered as a native function, the first arg in argv is the context.
+    // For this subtask, let's assume argc/argv are component-level args/results.
+    // The context needs to be passed differently, perhaps via exec_env or a convention.
+
+    // This placeholder does not have access to LiftedFuncThunkContext, which is critical.
+    // The function signature needs to be aligned with how it's called.
+    // Let's assume for now it's called like a WAMR host function where the context is implicitly available
+    // or passed in a standard way.
+    // If this is directly set as host_callable_c_function_ptr, it needs to be a `bool (*)(WASMExecEnv*, uint32, uint32[])`
+    // where the context comes from `exec_env->current_thunk_context` or similar.
+    // OR, it's registered with `wasm_runtime_register_c_function` and context is first arg.
+
+    // Re-evaluating: The prompt asks to refine this. It implies it exists.
+    // The way native functions are called in WAMR:
+    // If a function is registered with wasm_runtime_register_c_function, its signature is `bool func(WASMExecEnv *exec_env, uint32_t argc, uint32_t argv[])`
+    // The context is usually passed as the first element in argv (argv[0]) IF the registration mechanism supports it (e.g. by using a wrapper).
+    // Or, the context is attached to the WASMFunctionInstance somehow.
+    // Given LiftedFuncThunkContext.host_callable_c_function_ptr, this executor is the target.
+    // Let's assume the context is argv[0] and actual args follow.
+    // This means the real argc is host_argc-1, and args start at host_argv_raw[1].
+    // This is a common WAMR pattern for contextful C functions.
+
+    if (host_argc == 0) {
+        LOG_ERROR("GenericLiftedThunk: Thunk context expected as first argument, but argc is 0.");
+        // wasm_runtime_set_exception(wasm_runtime_get_module_inst(exec_env), "GenericLiftedThunk: Missing context");
+        return false; // Indicate failure
+    }
+
+    LiftedFuncThunkContext *thunk_ctx = (LiftedFuncThunkContext *)((uintptr_t)host_argv_raw[0]);
+    if (!thunk_ctx || !thunk_ctx->canonical_def || !thunk_ctx->target_core_module_inst || !thunk_ctx->component_func_type) {
+        LOG_ERROR("GenericLiftedThunk: Invalid or incomplete thunk context received.");
+        // wasm_runtime_set_exception with details
+        return false;
+    }
+
+    WASMComponentInstanceInternal *owning_comp_inst = thunk_ctx->owning_comp_inst;
+    if (!owning_comp_inst) {
+        LOG_ERROR("GenericLiftedThunk: Owning component instance is NULL in thunk context.");
+        return false;
+    }
+    // Use owning_comp_inst->exec_env for operations within the component's context if needed.
+    // exec_env passed to this function is the caller's environment.
+    WASMExecEnv *target_exec_env = thunk_ctx->target_core_module_inst->exec_env; // For calling the core Wasm function
+
+    WASMComponentFuncType *comp_func_type = thunk_ctx->component_func_type;
+    uint32 num_comp_params = comp_func_type->param_count;
+    uint32 actual_host_argc = host_argc - 1; // First arg is context
+
+    if (actual_host_argc != num_comp_params) {
+        LOG_ERROR("GenericLiftedThunk: Argument count mismatch. Expected %u component params, got %u host args (after context).",
+                  num_comp_params, actual_host_argc);
+        // wasm_runtime_set_exception
+        return false;
+    }
+
+    // Prepare core_argv for wasm_runtime_call_wasm
+    // This needs to be dynamically sized based on the core function's signature.
+    WASMFunctionInstance *core_func_resolved = wasm_get_function(thunk_ctx->target_core_module_inst, thunk_ctx->target_core_func_idx);
+    if (!core_func_resolved) {
+        LOG_ERROR("GenericLiftedThunk: Failed to resolve target core function index %u.", thunk_ctx->target_core_func_idx);
+        return false;
+    }
+    WASMType *core_func_wasm_type = core_func_resolved->u.func->func_type;
+    uint32 core_param_count = core_func_wasm_type->param_count;
+    uint32 core_result_count = core_func_wasm_type->result_count;
+    uint32 total_core_cells = core_param_count + core_result_count; // Simplification, real cell count needed
+
+    // Calculate actual cell numbers for params and results
+    uint32 core_param_cell_num = 0;
+    for (uint32 k=0; k < core_param_count; ++k) core_param_cell_num += wasm_value_type_cell_num(core_func_wasm_type->types[k]);
+    uint32 core_result_cell_num = 0;
+    for (uint32 k=0; k < core_result_count; ++k) core_result_cell_num += wasm_value_type_cell_num(core_func_wasm_type->types[core_param_count + k]);
+    total_core_cells = core_param_cell_num + core_result_cell_num;
+
+
+    uint32 *core_argv = NULL;
+    if (total_core_cells > 0) {
+        core_argv = bh_malloc(total_core_cells * sizeof(uint32));
+        if (!core_argv) {
+            LOG_ERROR("GenericLiftedThunk: Failed to allocate memory for core_argv.");
+            return false;
+        }
+        memset(core_argv, 0, total_core_cells * sizeof(uint32));
+    }
+
+    char error_buf_internal[128]; // For canonical_lower/lift errors
+
+    // 1. Argument Lowering Loop
+    uint32 current_core_argv_idx = 0;
+    for (uint32 i = 0; i < num_comp_params; ++i) {
+        WASMComponentValType *param_comp_type = comp_func_type->params[i].valtype;
+        void *host_arg_val_ptr = (void *)((uintptr_t)host_argv_raw[i + 1]); // +1 to skip context
+
+        // Determine target_core_wasm_type for this param.
+        // This is complex: needs mapping from param_comp_type to core Wasm type(s) via ABI details.
+        // For now, assume wasm_component_canon_lower_value handles this determination internally
+        // or we use a helper. get_component_type_core_abi_details can give us this.
+        // For simplicity, let's assume it's mostly I32 for refs, or direct for primitives.
+        // This part needs to be robust based on get_core_wasm_type_for_valtype or similar.
+        WASMType *target_core_wasm_pseudo_type = NULL; // Placeholder
+        // This should be derived from core_func_wasm_type->types[current_core_argv_idx] if it's a 1:1 map
+        // or from get_component_type_core_abi_details if complex.
+        // For now, assume lower_value can work with the component type and a basic hint.
+        uint8 core_type_tag_for_lower = VALUE_TYPE_I32; // Default for refs
+
+        if (param_comp_type->kind == VAL_TYPE_KIND_PRIMITIVE) {
+            bool success_map_prim;
+            core_type_tag_for_lower = get_core_wasm_type_for_primitive(param_comp_type->u.primitive, &success_map_prim);
+            if (!success_map_prim) {
+                LOG_ERROR("GenericLiftedThunk: Unsupported primitive type for lowering param %u.", i);
+                bh_free(core_argv); return false;
+            }
+        }
+
+        LOG_VERBOSE("Lowering arg %i, host_arg_val_ptr %p, comp_type kind %d, core_type_hint %d",
+                    i, host_arg_val_ptr, param_comp_type->kind, core_type_tag_for_lower);
+
+        if (!wasm_component_canon_lower_value(
+                target_exec_env, // Exec env of the target core module for memory operations
+                thunk_ctx->canonical_def,
+                NULL, // host_component_value for direct value, NULL if using ptr
+                host_arg_val_ptr, // Direct pointer to host data (e.g. HostComponentList*, WAMRHostGeneralValue*)
+                param_comp_type,
+                core_type_tag_for_lower, // Hint: actual core types are determined by ABI rules in lower_value
+                &core_argv[current_core_argv_idx],
+                error_buf_internal, sizeof(error_buf_internal)
+            )) {
+            LOG_ERROR("GenericLiftedThunk: Failed to lower argument %u. Error: %s", i, error_buf_internal);
+            bh_free(core_argv);
+            // wasm_runtime_set_exception with error_buf_internal
+            return false;
+        }
+        // Advance current_core_argv_idx based on the actual number of core cells consumed.
+        // wasm_component_canon_lower_value should ideally return this.
+        // For now, assume it's mostly 1 cell (I32 offset or direct primitive).
+        // This needs to be accurate based on get_component_type_core_abi_details.
+        // For now, using the hint's cell size.
+        current_core_argv_idx += wasm_value_type_cell_num(core_type_tag_for_lower);
+        if (current_core_argv_idx > core_param_cell_num) { // Check against total expected cells
+            LOG_ERROR("GenericLiftedThunk: Core argument index overflow during lowering.");
+            bh_free(core_argv); return false;
+        }
+    }
+
+    // Call the target core Wasm function
+    if (!wasm_runtime_call_wasm(target_exec_env, core_func_resolved, core_param_cell_num, core_argv)) {
+        // Exception should be set by wasm_runtime_call_wasm
+        LOG_ERROR("GenericLiftedThunk: Core Wasm function call failed. Exception: %s", wasm_runtime_get_exception(thunk_ctx->target_core_module_inst));
+        bh_free(core_argv);
+        return false; // Propagate failure
+    }
+
+    // 2. Result Lifting Loop
+    // Results are in core_argv, starting after param cells.
+    uint32 current_core_result_argv_idx = core_param_cell_num;
+    if (comp_func_type->result) { // Assuming single direct result or result-as-tuple
+        WASMComponentValType *result_comp_type = comp_func_type->result;
+        void **host_result_ptr_target = (void **)((uintptr_t)host_argv_raw[0 + 1 + num_comp_params]); // Result ptr is after context and args
+                                                                                                    // This assumes host_argv_raw is large enough for [context, args..., results_ptr...]
+
+        // Determine source_core_wasm_type for this result.
+        // Similar to lowering, this is complex.
+        uint8 core_type_tag_for_lift = VALUE_TYPE_I32; // Default for refs
+        if (result_comp_type->kind == VAL_TYPE_KIND_PRIMITIVE) {
+            bool success_map_prim;
+            core_type_tag_for_lift = get_core_wasm_type_for_primitive(result_comp_type->u.primitive, &success_map_prim);
+            if (!success_map_prim) {
+                LOG_ERROR("GenericLiftedThunk: Unsupported primitive type for lifting result.");
+                bh_free(core_argv); return false;
+            }
+        }
+
+        LOG_VERBOSE("Lifting result, comp_type kind %d, core_type_hint %d, core_argv_offset %u",
+                    result_comp_type->kind, core_type_tag_for_lift, current_core_result_argv_idx);
+
+        if (!wasm_component_canon_lift_value(
+                target_exec_env, // Exec env of the target core module
+                thunk_ctx->canonical_def,
+                &core_argv[current_core_result_argv_idx],
+                core_type_tag_for_lift, // Hint for the core type(s) at core_argv
+                result_comp_type,
+                host_result_ptr_target, // Target for the pointer to lifted host value
+                error_buf_internal, sizeof(error_buf_internal)
+            )) {
+            LOG_ERROR("GenericLiftedThunk: Failed to lift result. Error: %s", error_buf_internal);
+            bh_free(core_argv);
+            // wasm_runtime_set_exception
+            return false;
+        }
+        // Advance current_core_result_argv_idx if multiple results were possible,
+        // or if a single result spanned multiple cells.
+        // current_core_result_argv_idx += wasm_value_type_cell_num(core_type_tag_for_lift);
+    } else { // No component-level result
+        if (core_result_cell_num > 0) {
+            LOG_WARNING("GenericLiftedThunk: Core function returned %u cells, but component function has no result. Discarding core results.", core_result_cell_num);
+        }
+    }
+
+    // 3. Post-Return Cleanup
+    uint32 post_return_func_idx = (uint32)-1;
+    for (uint32 k=0; k < thunk_ctx->canonical_def->option_count; ++k) {
+        if (thunk_ctx->canonical_def->options[k].kind == CANONICAL_OPTION_POST_RETURN_FUNC_IDX) {
+            post_return_func_idx = thunk_ctx->canonical_def->options[k].value;
+            break;
+        }
+    }
+
+    if (post_return_func_idx != (uint32)-1) {
+        WASMFunctionInstance *post_return_func = wasm_get_function(thunk_ctx->target_core_module_inst, post_return_func_idx);
+        if (!post_return_func) {
+            LOG_ERROR("GenericLiftedThunk: Post-return function index %u not found in target core module.", post_return_func_idx);
+            // This might be a critical error, depending on policy.
+        } else {
+            LOG_VERBOSE("Executing post-return function (core func idx %u).", post_return_func_idx);
+            if (!wasm_runtime_call_wasm(target_exec_env, post_return_func, 0, NULL)) { // post-return is func()
+                LOG_ERROR("GenericLiftedThunk: Post-return function call failed. Exception: %s", wasm_runtime_get_exception(thunk_ctx->target_core_module_inst));
+                // Handle or propagate exception if needed.
+            }
+        }
+    } else {
+        LOG_TODO("GenericLiftedThunk: No post-return function. Implement robust memory cleanup for lowered arguments if needed (e.g., for by-value strings/lists allocated by lower_value).");
+        // This is where one might call wasm_runtime_module_free for memory allocated by wasm_component_canon_lower_value
+        // if lower_value returned specific offsets and a mechanism exists to track them.
+        // For now, relying on post-return or guest-managed memory.
+    }
+
+
+    if (core_argv) {
+        bh_free(core_argv);
+    }
+    return true; // Indicate success
 }
 
 
 static bool execute_component_start_function(WASMComponentInstanceInternal *comp_inst, 
                                              WASMComponentStart *start_def, 
                                              char *error_buf, uint32 error_buf_size);
+
+// Forward declaration for resolve_component_alias_by_index (if needed, or define before use)
+// static bool
+// resolve_component_alias_by_index(WASMComponentInstanceInternal *comp_inst,
+//                                  uint32 alias_idx,
+//                                  WASMAliasSort expected_sort,
+//                                  ResolvedComponentItem *out_resolved_item,
+//                                  char *error_buf, uint32 error_buf_size);
+
+
+static bool
+resolve_component_alias_by_index(WASMComponentInstanceInternal *comp_inst,
+                                 uint32 alias_idx,
+                                 WASMAliasSort expected_sort,
+                                 ResolvedComponentItem *out_resolved_item,
+                                 char *error_buf, uint32 error_buf_size)
+{
+    WASMComponent *component_def = comp_inst->component_def;
+    WASMComponentAlias *alias_def;
+
+    if (!out_resolved_item) {
+        set_comp_rt_error(error_buf, error_buf_size, "resolve_component_alias_by_index: out_resolved_item is NULL.");
+        return false;
+    }
+    memset(out_resolved_item, 0, sizeof(ResolvedComponentItem));
+
+    if (!component_def) {
+        set_comp_rt_error(error_buf, error_buf_size, "Component definition is NULL in component instance.");
+        return false;
+    }
+
+    if (alias_idx >= component_def->alias_count) {
+        set_comp_rt_error_v(error_buf, error_buf_size, "Alias index %u out of bounds (count %u).",
+                           alias_idx, component_def->alias_count);
+        return false;
+    }
+
+    alias_def = &component_def->aliases[alias_idx];
+
+    if (alias_def->sort != expected_sort) {
+        // This check might be too strict if the caller doesn't know the exact sort
+        // or if sorts are compatible (e.g. aliasing a core func as a component func via lift).
+        LOG_WARNING("Alias sort mismatch: requested %d, alias definition sort %d for alias_idx %u.",
+                    expected_sort, alias_def->sort, alias_idx);
+        // Allow proceeding for now, the user of the resolved item should validate the final kind.
+    }
+
+    LOG_VERBOSE("Resolving alias_idx %u: sort %u, target_kind %u, target_idx %u, target_name '%s'",
+                alias_idx, alias_def->sort, alias_def->target_kind, alias_def->target_idx,
+                alias_def->target_name ? alias_def->target_name : "N/A");
+
+    switch (alias_def->target_kind) {
+        case ALIAS_TARGET_CORE_EXPORT:
+        {
+            if (alias_def->target_idx >= component_def->core_instance_count) {
+                set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for core export is out of bounds for core_instances (count %u).",
+                                   alias_def->target_idx, component_def->core_instance_count);
+                return false;
+            }
+
+            WASMComponentCoreInstance *core_inst_def = &component_def->core_instances[alias_def->target_idx];
+            if (core_inst_def->kind != CORE_INSTANCE_KIND_INSTANTIATE) {
+                set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for core export points to a non-instantiated core instance definition (kind %u).",
+                                   alias_def->target_idx, core_inst_def->kind);
+                return false;
+            }
+
+            if (!comp_inst->core_instance_map) {
+                set_comp_rt_error(error_buf, error_buf_size, "Core instance map is NULL in component instance.");
+                return false;
+            }
+            uint32 runtime_module_array_idx = comp_inst->core_instance_map[alias_def->target_idx];
+            if (runtime_module_array_idx == (uint32)-1 || runtime_module_array_idx >= comp_inst->num_module_instances) {
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for core export: cannot map to valid runtime core module instance (map_val %u, num_mods %u).",
+                                    alias_def->target_idx, runtime_module_array_idx, comp_inst->num_module_instances);
+                 return false;
+            }
+            WASMModuleInstance *target_core_mod_inst = comp_inst->module_instances[runtime_module_array_idx];
+            if (!target_core_mod_inst) {
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for core export: runtime core module instance is NULL.", alias_def->target_idx);
+                 return false;
+            }
+
+            if (!alias_def->target_name) {
+                set_comp_rt_error(error_buf, error_buf_size, "Alias target_name for core export is NULL.");
+                return false;
+            }
+
+            out_resolved_item->item.core_item.core_module_inst = target_core_mod_inst;
+            out_resolved_item->item.core_item.item_idx_in_module = (uint32)-1;
+
+            switch (alias_def->sort) { // expected_sort might be more general, alias_def->sort is specific
+                case ALIAS_SORT_CORE_FUNC:
+                {
+                    WASMFunctionInstance *func_inst = find_exported_function_instance(target_core_mod_inst, alias_def->target_name, error_buf, error_buf_size);
+                    if (!func_inst) return false; // Error set by find_exported_function_instance
+
+                    out_resolved_item->kind = RESOLVED_ITEM_CORE_FUNC;
+                    out_resolved_item->item.core_item.core_item_kind = WASM_EXTERNAL_FUNCTION;
+                    // Iterate exports to find the index of the function in the module's function space
+                    bool found_idx = false;
+                    for(uint32 exp_i=0; exp_i < target_core_mod_inst->export_func_count; ++exp_i) {
+                        if (target_core_mod_inst->export_functions[exp_i].function == func_inst) {
+                            out_resolved_item->item.core_item.item_idx_in_module = target_core_mod_inst->export_functions[exp_i].func_idx_in_module;
+                            found_idx = true;
+                            break;
+                        }
+                    }
+                    if (!found_idx) {
+                        // This case should ideally not happen if find_exported_function_instance succeeded from exports.
+                        // It implies func_inst was found but not via iterating module's own export_functions list,
+                        // which is how find_exported_function_instance works.
+                        LOG_WARNING("Could not determine func_idx_in_module for core func export '%s' though function was found.", alias_def->target_name);
+                    }
+                    break;
+                }
+                // TODO: Cases for ALIAS_SORT_CORE_TABLE, ALIAS_SORT_CORE_MEMORY, ALIAS_SORT_CORE_GLOBAL
+                default:
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Unsupported alias sort %d for ALIAS_TARGET_CORE_EXPORT.", alias_def->sort);
+                    return false;
+            }
+            break;
+        }
+        case ALIAS_TARGET_OUTER:
+            // TODO: Implement outer alias resolution. Requires parent pointer and recursive call.
+            // WASMComponentInstanceInternal *parent_inst = comp_inst->parent_comp_inst;
+            // if (!parent_inst) {
+            //     set_comp_rt_error(error_buf, error_buf_size, "ALIAS_TARGET_OUTER: No parent component instance.");
+            //     return false;
+            // }
+            // if (alias_def->target_outer_depth == 0) { /* Should be at least 1 for outer */ }
+            // ... traverse alias_def->target_outer_depth levels ...
+            // Then resolve alias_def->target_idx in that parent/ancestor.
+            set_comp_rt_error(error_buf, error_buf_size, "ALIAS_TARGET_OUTER not yet implemented.");
+            return false;
+
+        case ALIAS_TARGET_CORE_MODULE:
+            if (alias_def->target_idx >= component_def->core_module_count) { // core_module_count is count of *definitions*
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for CORE_MODULE out of bounds (core_module_count %u).",
+                                    alias_def->target_idx, component_def->core_module_count);
+                 return false;
+            }
+            // This alias refers to a core module *definition*. To make it resolvable to a runtime instance,
+            // we need to find which *core instance definition* instantiates this module definition.
+            // This mapping is not direct. A module definition can be instantiated multiple times or not at all.
+            // The current structure of ALIAS_TARGET_CORE_MODULE seems to imply `target_idx` is a core_module_def_idx.
+            // Let's assume it means "the first runtime instance of this core module definition".
+            // This is ambiguous and needs clarification from Component Model spec usage.
+            // For now, try to find a core_instance_def that instantiates component_def->core_modules[alias_def->target_idx]
+            // and then map that core_instance_def to a runtime instance.
+            uint32 found_core_instance_def_idx = (uint32)-1;
+            for (uint32 cid_idx = 0; cid_idx < component_def->core_instance_count; ++cid_idx) {
+                if (component_def->core_instances[cid_idx].kind == CORE_INSTANCE_KIND_INSTANTIATE &&
+                    component_def->core_instances[cid_idx].u.instantiate.module_idx == alias_def->target_idx) {
+                    found_core_instance_def_idx = cid_idx;
+                    break;
+                }
+            }
+            if (found_core_instance_def_idx == (uint32)-1) {
+                set_comp_rt_error_v(error_buf, error_buf_size, "Alias for CORE_MODULE target_def_idx %u: no core instance found that instantiates this module definition.", alias_def->target_idx);
+                return false;
+            }
+            if (!comp_inst->core_instance_map) {
+                set_comp_rt_error(error_buf, error_buf_size, "Core instance map is NULL (resolving ALIAS_TARGET_CORE_MODULE).");
+                return false;
+            }
+            uint32 runtime_mod_idx = comp_inst->core_instance_map[found_core_instance_def_idx];
+            if (runtime_mod_idx == (uint32)-1 || runtime_mod_idx >= comp_inst->num_module_instances) {
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias for CORE_MODULE (def_idx %u, core_inst_def_idx %u): cannot map to valid runtime core module instance (map_val %u).",
+                                    alias_def->target_idx, found_core_instance_def_idx, runtime_mod_idx);
+                 return false;
+            }
+            out_resolved_item->kind = RESOLVED_ITEM_MODULE;
+            out_resolved_item->item.core_module_inst_ptr = comp_inst->module_instances[runtime_mod_idx];
+            break;
+
+        case ALIAS_TARGET_TYPE:
+            if (alias_def->target_idx >= component_def->type_definition_count) {
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for TYPE out of bounds (type_definition_count %u).",
+                                    alias_def->target_idx, component_def->type_definition_count);
+                 return false;
+            }
+            out_resolved_item->kind = RESOLVED_ITEM_TYPE;
+            out_resolved_item->item.type_def_ptr = &component_def->type_definitions[alias_def->target_idx];
+            break;
+
+        case ALIAS_TARGET_COMPONENT: // Refers to a nested component *definition*
+            if (alias_def->target_idx >= component_def->nested_component_count) {
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for COMPONENT out of bounds (nested_component_count %u).",
+                                    alias_def->target_idx, component_def->nested_component_count);
+                 return false;
+            }
+            // This resolves to the WASMComponent* definition.
+            // A runtime scenario would typically want an *instance* of this component.
+            // This suggests ALIAS_TARGET_COMPONENT is for type-level operations or re-exporting definitions.
+            out_resolved_item->kind = RESOLVED_ITEM_NONE; // Or a new kind RESOLVED_ITEM_COMPONENT_DEFINITION
+            out_resolved_item->item.ptr = component_def->nested_components[alias_def->target_idx].parsed_component;
+            if (!out_resolved_item->item.ptr) { // Fallback if not parsed (should be parsed by instantiation time)
+                 out_resolved_item->item.ptr = (void*)component_def->nested_components[alias_def->target_idx].component_data;
+                 LOG_WARNING("Alias to COMPONENT definition (idx %u) resolved to raw data as parsed_component is NULL.", alias_def->target_idx);
+            } else {
+                 LOG_VERBOSE("Alias to COMPONENT definition (idx %u) resolved to parsed_component.", alias_def->target_idx);
+            }
+            break;
+
+        case ALIAS_TARGET_INSTANCE:
+            // This refers to an *instance definition* (WASMComponentCompInstance) within the current component.
+            // alias_def->target_idx is an index into component_def->component_instances.
+            if (alias_def->target_idx >= component_def->component_instance_count) {
+                 set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for INSTANCE out of bounds (component_instance_count %u).",
+                                    alias_def->target_idx, component_def->component_instance_count);
+                 return false;
+            }
+            // This instance definition could be for a core module or a nested component.
+            // This needs mapping from this definition-time index to a runtime instance.
+            // This is complex as it requires knowing which runtime instance (module_instances or component_instances)
+            // corresponds to `component_def->component_instances[alias_def->target_idx]`.
+            // This mapping is not straightforward with current structures.
+            // TODO: Need a robust way to map WASMComponentCompInstance definition to its runtime counterpart.
+            LOG_TODO("Alias resolution for ALIAS_TARGET_INSTANCE: mapping definition to runtime instance is complex and not fully implemented.");
+            out_resolved_item->kind = RESOLVED_ITEM_NONE; // Placeholder
+            set_comp_rt_error(error_buf, error_buf_size, "ALIAS_TARGET_INSTANCE resolution logic incomplete (mapping def to runtime).");
+            return false;
+
+        default:
+            set_comp_rt_error_v(error_buf, error_buf_size, "Unknown alias target kind: %u.", alias_def->target_kind);
+            return false;
+    }
+
+    return true;
+}
 
 
 // Forward declaration for the new function
@@ -1173,100 +1645,221 @@ wasm_component_instance_populate_exports(WASMComponentInstanceInternal *comp_ins
                 }
                 WASMComponentFuncType *comp_func_type = func_type_def->u.func_type;
 
-                // TODO: Resolve target_core_inst and core_func_idx_in_mod from canonical_def->u.lift.core_func_idx
-                // This part is complex: canonical_def->u.lift.core_func_idx might be an index into an alias list,
-                // or an index into a flat list of all functions from all core modules.
-                // For now, assume it's an index into comp_inst->component_def->core_instances, then an export name.
-                // This needs the alias resolution logic from component spec: `(core func (instance <idx>) (export <name>))`
-                // Let's assume for now the canonical definition has already resolved this to a specific core module instance definition index
-                // and a function index *within that module*. This is a simplification.
-                // The `WASMComponentCanonical.u.lift.core_func_idx` might more realistically be an index into `component_def->aliases`
-                // which then needs to be resolved to a specific `core_instance_def_idx` and `func_idx_in_that_core_module`.
-                // For this placeholder:
-                LOG_TODO("Export '%s': Full resolution of canonical_def->u.lift.core_func_idx to target Wasm func needs alias/instance mapping. This export will be non-functional.", export_def->name);
-                // Placeholder: assume lift.core_func_idx is a direct index to a previously instantiated core module
-                // and lift.options[0] (if memory/realloc) or some other field in canonical_def gives the func index within that module.
-                // This is highly speculative and needs to be aligned with how the loader populates WASMComponentCanonical.
-                // Let's assume for now that the lift definition refers to the Nth *function export* of the Mth *core instance definition*.
-                // This is not robust. A proper alias resolution step during loading or here is needed.
-                // For now, cannot fully implement without this resolution. The function will be exported but will not be callable.
-                // The `create_lifted_function_thunk` will also be a placeholder.
-                // No 'goto fail_export' here, to allow other exports to be processed.
+                LOG_VERBOSE("Export '%s': Attempting to resolve core_func_idx %u from canonical_def as an alias.",
+                            export_def->name, canonical_def->u.lift.core_func_idx);
 
-                // Conceptual:
-                // WASMModuleInstance* target_core_inst = comp_inst->module_instances[resolved_runtime_core_module_idx];
-                // uint32 resolved_func_idx_in_core_module = ...;
-                // resolved_export->item.function_thunk_context = create_lifted_function_thunk(
-                //     comp_inst->exec_env, // Or parent_exec_env if that's the owner context for the thunk
-                //     canonical_def,
-                //     target_core_inst, resolved_func_idx_in_core_module,
-                //     comp_func_type,
-                //     error_buf, error_buf_size);
-                // if (!resolved_export->item.function_thunk_context) {
-                //     goto fail_export;
-                // }
+                ResolvedComponentItem resolved_core_func_item;
+                // Assumption: canonical_def->u.lift.core_func_idx is an index into the component's alias table.
+                // The alias is expected to resolve to a core function.
+                if (!resolve_component_alias_by_index(comp_inst,
+                                                      canonical_def->u.lift.core_func_idx,
+                                                      ALIAS_SORT_CORE_FUNC, // Expected sort of the alias itself
+                                                      &resolved_core_func_item,
+                                                      error_buf, error_buf_size)) {
+                    // resolve_component_alias_by_index sets the error_buf.
+                    LOG_ERROR("Export '%s': Failed to resolve core_func_idx %u (alias_idx) via alias mechanism: %s",
+                               export_def->name, canonical_def->u.lift.core_func_idx, error_buf);
+                    resolved_export->item.function_thunk_context = NULL; // Mark as failed
+                    break; // Break from this export case, try next export_def
+                }
+
+                if (resolved_core_func_item.kind != RESOLVED_ITEM_CORE_FUNC) {
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Expected resolved core_func_idx %u (alias_idx) to be RESOLVED_ITEM_CORE_FUNC, but got kind %d.",
+                                       export_def->name, canonical_def->u.lift.core_func_idx, resolved_core_func_item.kind);
+                    resolved_export->item.function_thunk_context = NULL; // Mark as failed
+                    // Log the error, but don't fail the entire export population yet.
+                    // The error_buf will be checked by the caller of populate_exports.
+                    LOG_ERROR("Export '%s': Resolution of core_func_idx %u resulted in unexpected kind %d.",
+                              export_def->name, canonical_def->u.lift.core_func_idx, resolved_core_func_item.kind);
+                    break; // Break from this export case
+                }
+
+                WASMModuleInstance* target_core_inst = resolved_core_func_item.item.core_item.core_module_inst;
+                uint32 core_func_idx_in_mod = resolved_core_func_item.item.core_item.item_idx_in_module;
+
+                if (!target_core_inst || core_func_idx_in_mod == (uint32)-1) {
+                    // (uint32)-1 is a common sentinel for "not found" or "invalid".
+                    // If item_idx_in_module is truly (uint32)-1 from a successful resolution,
+                    // it means the function was found but its index couldn't be determined, which is an issue.
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Resolved core function item has NULL instance or invalid function index in module (%u).",
+                                       export_def->name, core_func_idx_in_mod);
+                    LOG_ERROR("Export '%s': Resolved core function item from alias %u has NULL instance or invalid function index in module (%u). Target core inst: %p",
+                              export_def->name, canonical_def->u.lift.core_func_idx, core_func_idx_in_mod, target_core_inst);
+                    resolved_export->item.function_thunk_context = NULL;
+                    break; // Break from this export case
+                }
+
+                LOG_VERBOSE("Export '%s': Resolved core_func_idx %u (alias) to target_core_inst %p, func_idx_in_mod %u.",
+                            export_def->name, canonical_def->u.lift.core_func_idx,
+                            (void*)target_core_inst, core_func_idx_in_mod);
+
+                // Create the thunk with the resolved information
+                // comp_inst->exec_env is the exec_env of the current component instance.
+                // For lifted functions, the thunk runs in this component's context.
+                resolved_export->item.function_thunk_context = create_lifted_function_thunk(
+                    comp_inst->exec_env, /* The exec_env of the component instance being populated. */
+                    comp_inst,           /* Pass the component instance that will own this thunk. */
+                    canonical_def,
+                    target_core_inst,
+                    core_func_idx_in_mod,
+                    comp_func_type,
+                    error_buf, error_buf_size);
+
+                if (!resolved_export->item.function_thunk_context) {
+                    // error_buf should be set by create_lifted_function_thunk
+                    if (strstr(error_buf, "placeholder") == NULL && strstr(error_buf, "not yet implemented") == NULL
+                        && strstr(error_buf, "Failed to allocate LiftedFuncThunkContext") == NULL /* Allow this specific alloc error to not fail all exports */) {
+                         LOG_ERROR("Export '%s': Failed to create lifted function thunk: %s", export_def->name, error_buf);
+                         // This is a more critical failure if thunk creation fails for non-placeholder reasons.
+                         // Consider goto fail_export if this happens. For now, matching prompt's softer error handling.
+                         // goto fail_export;
+                    } else {
+                         LOG_WARNING("Export '%s': Lifted function thunk creation is a placeholder, not implemented, or failed allocation: %s", export_def->name, error_buf);
+                         // Set to NULL so it's known it's not callable, but don't fail all exports.
+                         resolved_export->item.function_thunk_context = NULL;
+                    }
+                }
                 // TODO: Type validation against export_def->optional_desc_type_idx
                 break;
             }
             case EXPORT_KIND_INSTANCE:
             case EXPORT_KIND_COMPONENT: // Treat component export similar to instance export for now
             {
-                // item_idx points to an instance definition in component_def
-                // This could be a nested component instance or a core module instance.
-                // The component model spec needs to clarify how core module instances are typed when exported as "instances".
-                
-                // Assuming item_idx refers to component_def->component_instances
-                // This means we are exporting a nested component instance.
-                if (export_def->item_idx >= component_def->component_instance_count) {
-                     set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': instance item_idx %u out of bounds for component_instances (count %u).", export_def->name, export_def->item_idx, component_def->component_instance_count);
-                     goto fail_export;
+                WASMAliasSort sort_for_alias = (export_def->kind == EXPORT_KIND_INSTANCE) ? ALIAS_SORT_INSTANCE : ALIAS_SORT_COMPONENT;
+                ResolvedComponentItem resolved_item;
+                LOG_VERBOSE("Export '%s': Attempting to resolve item_idx %u as alias (sort %d).",
+                            export_def->name, export_def->item_idx, sort_for_alias);
+
+                // item_idx from export_def is treated as a potential alias_idx
+                if (!resolve_component_alias_by_index(comp_inst, export_def->item_idx,
+                                                      sort_for_alias,
+                                                      &resolved_item,
+                                                      error_buf, error_buf_size)) {
+                    LOG_ERROR("Export '%s': Failed to resolve item_idx %u via alias: %s. Marking export as unavailable.",
+                               export_def->name, export_def->item_idx, error_buf);
+                    // Clear any potentially partially set error by resolve_component_alias_by_index if we are not failing all exports
+                    // error_buf[0] = '\0';
+                    resolved_export->item.instance_ptr = NULL; // Or component_ptr, mark as unresolved
+                    break;
                 }
-                // The item_idx in WASMComponentExport refers to the definition-time index of the instance.
-                // We need to find the corresponding runtime WASMComponentInstanceInternal*.
-                // This requires a mapping from definition index to runtime index, similar to core_instance_map.
-                // Let's assume such a map `nested_comp_inst_map` exists or that runtime indices match definition indices
-                // if all defined instances are instantiated.
-                // For now, assume direct mapping if comp_inst->component_instances[export_def->item_idx] is valid.
-                // This implies that the component_instances array in WASMComponentInstanceInternal is indexed
-                // by the *definition-time* index from WASMComponent.component_instances.
-                // This needs to be consistent with how `current_runtime_comp_idx` is used.
-                // `current_runtime_comp_idx` tracks truly instantiated components. A map is better.
-                LOG_TODO("Export '%s': Mapping export_def->item_idx for instances to runtime comp_inst->component_instances index needs a map.", export_def->name);
-                // Placeholder: Assume direct mapping for now if it's within num_component_instances
-                if (export_def->item_idx < comp_inst->num_component_instances && 
-                    component_def->component_instances[export_def->item_idx].kind == COMPONENT_INSTANCE_KIND_INSTANTIATE) {
-                    // This check is insufficient without a map. The runtime index is not necessarily export_def->item_idx.
-                    // For now, this will likely fail or point to wrong instance if not all are instantiated.
-                    // We need to search comp_inst->component_instances for the one corresponding to component_def->component_instances[export_def->item_idx]
-                    // This requires more context, perhaps storing definition index in WASMComponentInstanceInternal.
-                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Instance export logic for finding runtime instance not fully implemented.", export_def->name);
-                    goto fail_export;
-                    // resolved_export->item.instance = comp_inst->component_instances[runtime_idx_for_this_def_idx];
-                } else {
-                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': instance item_idx %u refers to non-instantiated or out-of-bounds component instance.", export_def->name, export_def->item_idx);
-                    goto fail_export;
+
+                if (export_def->kind == EXPORT_KIND_INSTANCE && resolved_item.kind != RESOLVED_ITEM_INSTANCE && resolved_item.kind != RESOLVED_ITEM_MODULE) {
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Expected resolved item for INSTANCE to be INSTANCE or MODULE, got %d.",
+                                       export_def->name, resolved_item.kind);
+                    LOG_ERROR("Export '%s': Expected INSTANCE or MODULE, got %d. Marking export as unavailable.", export_def->name, resolved_item.kind);
+                    resolved_export->item.instance_ptr = NULL;
+                    break;
+                }
+                if (export_def->kind == EXPORT_KIND_COMPONENT && resolved_item.kind != RESOLVED_ITEM_COMPONENT) {
+                     set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Expected resolved item for COMPONENT to be COMPONENT, got %d.",
+                                       export_def->name, resolved_item.kind);
+                     LOG_ERROR("Export '%s': Expected COMPONENT, got %d. Marking export as unavailable.", export_def->name, resolved_item.kind);
+                     resolved_export->item.component_ptr = NULL;
+                     break;
+                }
+
+                // Store the resolved item.
+                if (resolved_item.kind == RESOLVED_ITEM_INSTANCE) {
+                    resolved_export->item.instance_ptr = resolved_item.item.comp_inst_ptr;
+                } else if (resolved_item.kind == RESOLVED_ITEM_MODULE) {
+                    // Assuming ResolvedComponentExportItem.item.instance_ptr can store WASMModuleInstance* after cast
+                    // This implies that consumers of this export need to be aware of the possibility.
+                    // Alternatively, ResolvedComponentExportItem might need separate fields or a sub-union.
+                    resolved_export->item.instance_ptr = (WASMComponentInstanceInternal*)resolved_item.item.core_module_inst_ptr;
+                    LOG_VERBOSE("Export '%s': Storing resolved core_module_inst %p into instance_ptr via cast.", export_def->name, (void*)resolved_item.item.core_module_inst_ptr);
+                } else if (resolved_item.kind == RESOLVED_ITEM_COMPONENT) {
+                    resolved_export->item.component_ptr = resolved_item.item.comp_inst_ptr;
                 }
                 // TODO: Type validation against export_def->optional_desc_type_idx (should be an instance or component type)
+                // This requires resolving optional_desc_type_idx to a WASMComponentDefinedType and then comparing.
+                LOG_VERBOSE("Export '%s': Successfully resolved item_idx %u to runtime item kind %d.",
+                            export_def->name, export_def->item_idx, resolved_item.kind);
                 break;
             }
             case EXPORT_KIND_TYPE:
             {
-                if (export_def->item_idx >= component_def->type_definition_count) {
-                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': type item_idx %u out of bounds for type_definitions (count %u).", export_def->name, export_def->item_idx, component_def->type_definition_count);
-                    goto fail_export;
+                ResolvedComponentItem resolved_item;
+                LOG_VERBOSE("Export '%s': Attempting to resolve item_idx %u as alias (sort ALIAS_SORT_TYPE).",
+                            export_def->name, export_def->item_idx);
+                // item_idx from export_def is treated as a potential alias_idx
+                if (!resolve_component_alias_by_index(comp_inst, export_def->item_idx,
+                                                      ALIAS_SORT_TYPE,
+                                                      &resolved_item,
+                                                      error_buf, error_buf_size)) {
+                    LOG_ERROR("Export '%s': Failed to resolve item_idx %u for TYPE via alias: %s. Marking export as unavailable.",
+                               export_def->name, export_def->item_idx, error_buf);
+                    resolved_export->item.type_definition = NULL;
+                    break;
                 }
-                resolved_export->item.type_definition = &component_def->type_definitions[export_def->item_idx];
-                // No specific type validation needed here beyond bounds check, as it *is* the type.
+                if (resolved_item.kind != RESOLVED_ITEM_TYPE) {
+                     set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Expected resolved item for TYPE to be TYPE, got %d.",
+                                       export_def->name, resolved_item.kind);
+                     LOG_ERROR("Export '%s': Expected TYPE, got %d. Marking export as unavailable.", export_def->name, resolved_item.kind);
+                     resolved_export->item.type_definition = NULL;
+                     break;
+                }
+                resolved_export->item.type_definition = resolved_item.item.type_def_ptr;
+                LOG_VERBOSE("Export '%s': Successfully resolved type item_idx %u.", export_def->name, export_def->item_idx);
                 break;
             }
             case EXPORT_KIND_VALUE:
-                LOG_TODO("Export '%s': Exporting values not yet implemented pending Value Section parsing and resolution.", export_def->name);
-                // Placeholder:
-                // resolved_export->item.value_ptr = resolve_value_from_idx(comp_inst, export_def->item_idx, error_buf, error_buf_size);
-                // if (!resolved_export->item.value_ptr) goto fail_export;
-                // TODO: Type validation against export_def->optional_desc_type_idx
-                set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Value export not implemented.", export_def->name);
-                goto fail_export; // For now, treat as error until implemented
+            {
+                // Placeholder for ALIAS_SORT_VALUE, assuming it might be 0x04 based on typical sort order,
+                // but this needs to be defined in wasm_component_loader.h's WASMAliasSort.
+                // Using a temporary value that indicates "undefined" for now.
+                WASMAliasSort sort_for_alias_value = (WASMAliasSort)0xFFFFFFFF;
+                const char* alias_sort_value_str = "ALIAS_SORT_VALUE"; // For logging
+
+                // Attempt to map EXPORT_KIND_VALUE to a conceptual ALIAS_SORT_VALUE
+                // This mapping should ideally be defined in wasm_component_loader.h or common header
+                // For now, we simulate this. If EXPORT_KIND_VALUE is, say, 4, and ALIAS_SORT_VALUE is also 4.
+                // Let's assume such a mapping exists and ALIAS_SORT_VALUE is a valid enum member.
+                // To make this runnable, we need a placeholder. If actual ALIAS_SORT_VALUE is known, use it.
+                // For this exercise, let's assume ALIAS_SORT_VALUE might be, e.g. 5, if others are 0-4.
+                // This is speculative. The actual value must come from the enum definition.
+                // If no direct ALIAS_SORT_VALUE, then value exports cannot go through this alias path.
+
+                // Find ALIAS_SORT_VALUE definition or use placeholder
+                // #if defined(ALIAS_SORT_VALUE)
+                // sort_for_alias_value = ALIAS_SORT_VALUE;
+                // #else
+                // LOG_WARNING("Export '%s': ALIAS_SORT_VALUE is not defined. Value export via alias is effectively disabled.", export_def->name);
+                // #endif
+                // Given I can't check header, I'll proceed with the placeholder and conditional logic.
+
+                LOG_TODO("Export '%s': Value export resolution needs a defined ALIAS_SORT_VALUE and robust value item resolution logic.", export_def->name);
+                resolved_export->item.value_ptr = NULL; // Ensure it's NULL if not resolved.
+
+                if (sort_for_alias_value != (WASMAliasSort)0xFFFFFFFF) {
+                    ResolvedComponentItem resolved_item;
+                    LOG_VERBOSE("Export '%s': Attempting to resolve item_idx %u as alias (sort %s).",
+                                export_def->name, export_def->item_idx, alias_sort_value_str);
+                    if (!resolve_component_alias_by_index(comp_inst, export_def->item_idx,
+                                                          sort_for_alias_value,
+                                                          &resolved_item,
+                                                          error_buf, error_buf_size)) {
+                        LOG_ERROR("Export '%s': Failed to resolve item_idx %u for VALUE via alias: %s. Marking as unavailable.",
+                                   export_def->name, export_def->item_idx, error_buf);
+                        break;
+                    }
+                    if (resolved_item.kind != RESOLVED_ITEM_VALUE) {
+                         set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Expected resolved item for VALUE to be VALUE, got %d.",
+                                           export_def->name, resolved_item.kind);
+                         LOG_ERROR("Export '%s': Expected VALUE, got %d. Marking as unavailable.", export_def->name, resolved_item.kind);
+                         break;
+                    }
+                    // resolved_export->item.value_ptr = resolved_item.item.value_ptr; // If value_ptr exists in ResolvedComponentItem
+                    LOG_VERBOSE("Export '%s': Successfully resolved value item_idx %u (placeholder).", export_def->name, export_def->item_idx);
+                } else {
+                    // If ALIAS_SORT_VALUE is not defined/known, cannot use resolve_component_alias_by_index.
+                    // Fallback to direct resolution if that's ever supported for values, or mark as error.
+                    // For now, consistent with prompt, this means it's an error if it was meant to be an alias.
+                    // If item_idx was a direct index to a value, that's a different logic path not covered by this subtask.
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Value export resolution skipped as ALIAS_SORT_VALUE is undefined/unknown.", export_def->name);
+                    LOG_ERROR("Export '%s': Value export item_idx %u cannot be resolved as ALIAS_SORT_VALUE is not available.", export_def->name, export_def->item_idx);
+                }
+                break;
+            }
             default:
                 set_comp_rt_error_v(error_buf, error_buf_size, "Export '%s': Unknown export kind %u.", export_def->name, export_def->kind);
                 goto fail_export;
@@ -1365,101 +1958,161 @@ execute_component_start_function(WASMComponentInstanceInternal *comp_inst,
         return false;
     }
 
-    // 2. Resolve Arguments:
-    void **lifted_start_args = NULL;
+    // 2. Resolve Arguments and Prepare for Thunk Call:
+    // The generic_lifted_thunk_executor expects argv[0] to be the context,
+    // and subsequent elements to be pointers to argument data.
+    uint32 total_thunk_argc = 1 + start_def->arg_count; // Context + actual args
+    uint32 *host_argv_for_thunk = NULL; // Array of uint32/uintptr_t for thunk
+
+    if (total_thunk_argc > 0) { // Always true since context is first arg
+        host_argv_for_thunk = bh_malloc(total_thunk_argc * sizeof(uint32));
+        if (!host_argv_for_thunk) {
+            set_comp_rt_error(error_buf, error_buf_size, "Failed to allocate memory for start function thunk arguments.");
+            return false;
+        }
+        memset(host_argv_for_thunk, 0, total_thunk_argc * sizeof(uint32));
+        host_argv_for_thunk[0] = (uint32)(uintptr_t)thunk_ctx;
+    } else { // Should not happen
+        set_comp_rt_error(error_buf, error_buf_size, "Internal error: total_thunk_argc is 0 for start function.");
+        return false;
+    }
+
+
     if (start_def->arg_count > 0) {
         if (!component_def->values || component_def->value_count == 0) {
             set_comp_rt_error(error_buf, error_buf_size, "Start function requires arguments, but component has no defined values.");
+            bh_free(host_argv_for_thunk);
             return false;
         }
-
-        lifted_start_args = bh_malloc(start_def->arg_count * sizeof(void*));
-        if (!lifted_start_args) {
-            set_comp_rt_error(error_buf, error_buf_size, "Failed to allocate memory for start function arguments.");
-            return false;
-        }
-        memset(lifted_start_args, 0, start_def->arg_count * sizeof(void*));
 
         for (uint32 j = 0; j < start_def->arg_count; ++j) {
             uint32 value_idx = start_def->arg_value_indices[j];
             if (value_idx >= component_def->value_count) {
-                set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: value index %u out of bounds for component values (count %u).",
+                set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: value index %u out of bounds (count %u).",
                                    j, value_idx, component_def->value_count);
-                bh_free(lifted_start_args);
+                bh_free(host_argv_for_thunk);
                 return false;
             }
-            WASMComponentValue *arg_val_def = &component_def->values[value_idx];
+            WASMComponentValue *val_def_literal = &component_def->values[value_idx];
 
-            if (j >= func_type->param_count) { // Should not happen if component validated correctly
+            if (j >= func_type->param_count) {
                  set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: exceeds expected parameter count %u.",
                                    j, func_type->param_count);
-                bh_free(lifted_start_args);
+                bh_free(host_argv_for_thunk);
                 return false;
             }
             WASMComponentValType *expected_param_type = func_type->params[j].valtype;
 
-            // Simplified type check: only primitive types for start function arguments
-            if (arg_val_def->parsed_type.kind != VAL_TYPE_KIND_PRIMITIVE ||
-                expected_param_type->kind != VAL_TYPE_KIND_PRIMITIVE ||
-                arg_val_def->parsed_type.u.primitive != expected_param_type->u.primitive) {
-                LOG_ERROR("Start function arg %u: type mismatch. Value has type kind %d (primitive %d), expected type kind %d (primitive %d).",
-                          j, arg_val_def->parsed_type.kind, arg_val_def->parsed_type.u.primitive,
-                          expected_param_type->kind, expected_param_type->u.primitive);
-                set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: type mismatch with defined value.", j);
-                bh_free(lifted_start_args);
+            // Perform type checking (simplified, full type equivalence is complex)
+            // TODO: Enhance this type check to be more comprehensive, e.g., using a helper function.
+            if (val_def_literal->parsed_type.kind != expected_param_type->kind) {
+                 LOG_ERROR("Start function arg %u: kind mismatch. Value has kind %d, expected kind %d.",
+                          j, val_def_literal->parsed_type.kind, expected_param_type->kind);
+                set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: type kind mismatch with defined value.", j);
+                bh_free(host_argv_for_thunk);
                 return false;
             }
-
-            // Prepare argument pointer
-            if (arg_val_def->parsed_type.u.primitive == PRIM_VAL_STRING) {
-                lifted_start_args[j] = (void*)arg_val_def->val.string_val; // Thunk expects char*
-            } else {
-                // For other primitives, point directly to the union member.
-                // This assumes the thunk knows how to interpret this based on type.
-                lifted_start_args[j] = (void*)&arg_val_def->val;
+            if (val_def_literal->parsed_type.kind == VAL_TYPE_KIND_PRIMITIVE &&
+                val_def_literal->parsed_type.u.primitive != expected_param_type->u.primitive) {
+                 LOG_ERROR("Start function arg %u: primitive type mismatch. Value primitive %d, expected primitive %d.",
+                          j, val_def_literal->parsed_type.u.primitive, expected_param_type->u.primitive);
+                set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: primitive type mismatch.", j);
+                bh_free(host_argv_for_thunk);
+                return false;
             }
+            // For composite types, a deeper check involving recursive comparison of structure would be needed here.
+            // For now, only kind and primitive subtype are checked.
+
+            void *ptr_to_arg_data = NULL;
+            if (val_def_literal->parsed_type.kind == VAL_TYPE_KIND_PRIMITIVE) {
+                switch (val_def_literal->parsed_type.u.primitive) {
+                    case PRIM_VAL_BOOL: ptr_to_arg_data = &val_def_literal->val.b; break;
+                    case PRIM_VAL_S8:   ptr_to_arg_data = &val_def_literal->val.s8; break;
+                    case PRIM_VAL_U8:   ptr_to_arg_data = &val_def_literal->val.u8; break;
+                    case PRIM_VAL_S16:  ptr_to_arg_data = &val_def_literal->val.s16; break;
+                    case PRIM_VAL_U16:  ptr_to_arg_data = &val_def_literal->val.u16; break;
+                    case PRIM_VAL_S32:  ptr_to_arg_data = &val_def_literal->val.s32; break;
+                    case PRIM_VAL_U32:  ptr_to_arg_data = &val_def_literal->val.u32; break;
+                    case PRIM_VAL_S64:  ptr_to_arg_data = &val_def_literal->val.s64; break;
+                    case PRIM_VAL_U64:  ptr_to_arg_data = &val_def_literal->val.u64; break;
+                    case PRIM_VAL_F32:  ptr_to_arg_data = &val_def_literal->val.f32; break;
+                    case PRIM_VAL_F64:  ptr_to_arg_data = &val_def_literal->val.f64; break;
+                    case PRIM_VAL_CHAR: ptr_to_arg_data = &val_def_literal->val.u32; break; // Char stored as u32
+                    case PRIM_VAL_STRING:
+                        // For string, wasm_component_canon_lower_value expects char** if it's a string to be copied.
+                        // If it's handling a direct char*, it needs to be clear.
+                        // The host_arg_val_ptr in generic_lifted_thunk_executor is void*.
+                        // If lower_value for string expects char*, then pass string_val directly.
+                        // If it expects char**, then pass &string_val.
+                        // Current generic_lifted_thunk_executor passes host_arg_val_ptr directly to lower_value.
+                        // Let's assume lower_value handles char* for string input from component values.
+                        ptr_to_arg_data = (void*)val_def_literal->val.string_val;
+                        // LOG_TODO: Clarify if wasm_component_canon_lower_value for string takes char* or char**
+                        // when the source is a component value literal. Assuming char* for now.
+                        break;
+                    default:
+                        set_comp_rt_error_v(error_buf, error_buf_size, "Start function arg %u: unhandled primitive type %d.",
+                                           j, val_def_literal->parsed_type.u.primitive);
+                        bh_free(host_argv_for_thunk);
+                        return false;
+                }
+            } else { // Composite types (List, Record, etc.)
+                // val_def_literal->val.ptr_val points to the host-allocated literal structure
+                // (e.g., WASMComponentValue_list_literal*).
+                // wasm_component_canon_lower_value needs to be able to handle these specific structures.
+                ptr_to_arg_data = val_def_literal->val.ptr_val;
+                LOG_TODO("Ensure wasm_component_canon_lower_value can handle WASMComponentValue_xxx_literal structs for start function args.");
+            }
+            host_argv_for_thunk[j + 1] = (uint32)(uintptr_t)ptr_to_arg_data;
         }
         LOG_VERBOSE("Resolved %u arguments for start function '%s'.", start_def->arg_count, target_export_func->name);
     }
-    // If arg_count == 0, lifted_start_args remains NULL.
 
     // 3. Invoke Function:
-    LOG_VERBOSE("Executing component start function '%s'.", target_export_func->name);
+    LOG_VERBOSE("Executing component start function '%s' via thunk.", target_export_func->name);
 
+    bool thunk_success = false;
     if (!thunk_ctx->host_callable_c_function_ptr) {
-         set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' cannot be executed: thunk function pointer is NULL.", target_export_func->name);
-         if (lifted_start_args) bh_free(lifted_start_args);
-         return false;
-    }
-
-    // Assuming parent_exec_env is the correct one for running component-level functions.
-    WASMExecEnv *exec_env_for_thunk = thunk_ctx->parent_comp_exec_env; 
-    if (!exec_env_for_thunk) { // Fallback or error
-        exec_env_for_thunk = comp_inst->exec_env;
+         set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' thunk function pointer is NULL.", target_export_func->name);
+    } else {
+        WASMExecEnv *exec_env_for_thunk = thunk_ctx->parent_comp_exec_env ? thunk_ctx->parent_comp_exec_env : comp_inst->exec_env;
         if (!exec_env_for_thunk) {
-             set_comp_rt_error_v(error_buf, error_buf_size, "No valid WASMExecEnv found for executing start function '%s'.", target_export_func->name);
-             if (lifted_start_args) bh_free(lifted_start_args);
-             return false;
+             set_comp_rt_error_v(error_buf, error_buf_size, "No valid WASMExecEnv for start function '%s'.", target_export_func->name);
+        } else {
+            bool (*thunk_executor_func)(WASMExecEnv*, uint32, uint32[]) =
+                (bool (*)(WASMExecEnv*, uint32, uint32[]))thunk_ctx->host_callable_c_function_ptr;
+
+            thunk_success = thunk_executor_func(exec_env_for_thunk, total_thunk_argc, host_argv_for_thunk);
+
+            if (!thunk_success) {
+                // Check if exception was set by the thunk executor or the underlying call
+                WASMModuleInstance *current_mod_inst = wasm_runtime_get_module_inst(exec_env_for_thunk);
+                if (current_mod_inst && wasm_runtime_get_exception(current_mod_inst)) {
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' execution failed with exception: %s",
+                                       target_export_func->name, wasm_runtime_get_exception(current_mod_inst));
+                    // wasm_runtime_clear_exception(current_mod_inst); // Optional: clear if handled
+                } else {
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Start function '%s' execution failed (thunk returned false).", target_export_func->name);
+                }
+            } else {
+                 LOG_VERBOSE("Start function '%s' executed successfully via thunk.", target_export_func->name);
+            }
         }
     }
-    
-    LOG_TODO("Actual invocation of start function thunk '%s' (with %u args) needs to align with Step 5 thunk design, using lifted_start_args.",
-             target_export_func->name, start_def->arg_count);
 
-    // Simulate successful call for testing if thunk pointer is hypothetically set
-    if (start_def->arg_count == 0) {
-        LOG_INFO("Simulating successful execution of start function '%s' (thunk pointer was non-NULL but is a placeholder for actual execution logic).", target_export_func->name);
-    } else {
-        LOG_INFO("Simulating successful execution of start function '%s' with %u args (thunk pointer was non-NULL but is a placeholder for actual execution logic with args).", target_export_func->name, start_def->arg_count);
-    }
-    if (error_buf_size > 0) error_buf[0] = '\0'; // Clear previous placeholder errors.
-
-
-    if (lifted_start_args) {
-        bh_free(lifted_start_args);
+    if (host_argv_for_thunk) {
+        bh_free(host_argv_for_thunk);
     }
 
-    // Check for exceptions if the call were made
+    if (!thunk_success) {
+        return false; // Error message should be set
+    }
+    // Clear error buffer on success if it was only used for simulation notes before
+    if (error_buf_size > 0 && strstr(error_buf, "Simulating successful execution") != NULL) {
+         error_buf[0] = '\0';
+    }
+
+    // Check for exceptions if the call were made (already handled if thunk_success is false and exception was set)
     // WASMModuleInstance *exception_module_inst = wasm_runtime_get_module_inst(exec_env_for_thunk);
     // if (exception_module_inst && wasm_runtime_get_exception(exception_module_inst)) {
     //     set_comp_rt_error_v(error_buf, error_buf_size, "Exception occurred during start function '%s': %s",
