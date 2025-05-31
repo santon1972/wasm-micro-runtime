@@ -68,3 +68,22 @@ if (NOT WAMR_BUILD_TARGET STREQUAL "X86_32")
   # HW_BOUND_CHECK is not supported on X86_32
   add_subdirectory (runtime-common)
 endif ()
+
+# WAMR Compiler Component Model Tests (Python)
+# Check if wamrc is built, as it's a dependency for these tests
+if (TARGET wamrc)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if (Python3_FOUND)
+        add_test(
+            NAME wamr_compiler_component_tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../wamr-compiler/component/test_component_aot.py
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../wamr-compiler/component
+        )
+        # Add dependency to ensure wamrc is built before running this test
+        add_dependencies(wamr_compiler_component_tests wamrc)
+    else()
+        message(WARNING "Python3 not found, skipping wamr_compiler_component_tests.")
+    endif()
+else()
+    message(STATUS "wamrc target not found, skipping wamr_compiler_component_tests. (This is normal if building iwasm only)")
+endif()

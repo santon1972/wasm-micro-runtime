@@ -1418,6 +1418,7 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     bool ret = false;
     char buf[32];
     bool quick_invoke_c_api_import = false;
+    AOTImportFunc *import_func = NULL;
 
     /* Check function index */
     if (func_idx >= import_func_count + func_count) {
@@ -1427,8 +1428,9 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
 
     /* Get function type */
     if (func_idx < import_func_count) {
-        func_type = import_funcs[func_idx].func_type;
-        signature = import_funcs[func_idx].signature;
+        import_func = &import_funcs[func_idx];
+        func_type = import_func->func_type;
+        signature = import_func->signature;
     }
     else {
         func_type =
@@ -1545,18 +1547,59 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
     }
 
     if (func_idx < import_func_count) {
-        if (comp_ctx->aux_stack_frame_type == AOT_STACK_FRAME_TYPE_STANDARD
-            && !commit_params_to_frame_of_import_func(
-                comp_ctx, func_ctx, func_type, param_values + 1)) {
-            goto fail;
-        }
+        bh_assert(import_func); // Should be set above
+        if (import_func->is_cross_component_call) {
+            // Cross-component call detected
+            os_printf_sgx("AOT: Detected cross-component call for import func_idx %u (%s.%s)\n",
+                          func_idx, import_func->module_name, import_func->func_name);
 
-        if (!(import_func_idx = I32_CONST(func_idx))) {
-            aot_set_last_error("llvm build inbounds gep failed.");
-            goto fail;
-        }
+            LLVMValueRef wrapper_func = aot_get_or_create_component_call_wrapper(comp_ctx, func_ctx, func_idx);
+            if (!wrapper_func) {
+                // Error already set by aot_get_or_create_component_call_wrapper
+                goto fail;
+            }
 
-        /* Initialize parameter types of the LLVM function */
+            LLVMTypeRef wrapper_func_type = LLVMGlobalGetValueType(wrapper_func);
+            // LLVMGetReturnType(LLVMGetElementType(LLVMTypeOf(wrapper_func))) should also work for func_type
+
+            // Call the wrapper
+            // param_values already includes exec_env at [0] and any extra return pointers
+            // The number of actual parameters for the LLVM call is 1 (exec_env) + core_func_type->param_count + ext_ret_count
+            uint32 total_call_params = 1 + func_type->param_count + ext_ret_count;
+
+            value_ret = LLVMBuildCall2(comp_ctx->builder, wrapper_func_type, wrapper_func,
+                                       param_values,
+                                       total_call_params,
+                                       (func_type->result_count > 0 ? "call_component_wrapper" : ""));
+            if (!value_ret && func_type->result_count > 0) { // Void calls return NULL for value_ret
+                 if (LLVMGetLastError()) {
+                    aot_set_last_error(LLVMGetLastError());
+                    LLVMDisposeMessage(LLVMGetLastError());
+                 } else {
+                    aot_set_last_error("LLVM build call to component wrapper function failed.");
+                 }
+                goto fail;
+            }
+            // If the wrapper sets an exception, it should be propagated.
+            // The wrapper itself is responsible for calling check_exception_thrown if its internal calls can throw.
+            // Or, the runtime exception flag will be checked after any call.
+             if (!check_exception_thrown(comp_ctx, func_ctx)) {
+                goto fail;
+            }
+        }
+        else { // Regular import call (not cross-component)
+            if (comp_ctx->aux_stack_frame_type == AOT_STACK_FRAME_TYPE_STANDARD
+                && !commit_params_to_frame_of_import_func(
+                    comp_ctx, func_ctx, func_type, param_values + 1)) {
+                goto fail;
+            }
+
+            if (!(import_func_idx = I32_CONST(func_idx))) {
+                aot_set_last_error("llvm build inbounds gep failed.");
+                goto fail;
+            }
+
+            /* Initialize parameter types of the LLVM function */
         total_size = sizeof(LLVMTypeRef) * (uint64)(param_count + 1);
         if (total_size >= UINT32_MAX
             || !(param_types = wasm_runtime_malloc((uint32)total_size))) {
@@ -1649,12 +1692,12 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
                         quick_invoke_c_api_import = true;
                 }
             }
-            if (quick_invoke_c_api_import) {
+            if (quick_invoke_c_api_import) { // This path is inside the 'else' of is_cross_component_call
                 if (!call_aot_invoke_c_api_native(comp_ctx, func_ctx, func_idx,
                                                   func_type, param_values + 1))
                     goto fail;
             }
-            else {
+            else { // This path is inside the 'else' of is_cross_component_call
                 /* call aot_invoke_native() */
                 if (!call_aot_invoke_native_func(
                         comp_ctx, func_ctx, import_func_idx, func_type,
@@ -1820,8 +1863,9 @@ aot_compile_op_call(AOTCompContext *comp_ctx, AOTFuncContext *func_ctx,
             goto fail;
     }
 
-    if (func_type->result_count > 0 && !quick_invoke_c_api_import) {
+    if (func_type->result_count > 0 && !quick_invoke_c_api_import) { // quick_invoke_c_api_import handles its own PUSH
         /* Push the first result to stack */
+        // For cross-component, value_ret is from the wrapper. For others, it's from invoke_native or direct call.
         PUSH(value_ret, func_type->types[func_type->param_count]);
         /* Load extra result from its address and push to stack */
         for (i = 0; i < ext_ret_count; i++) {

@@ -80,7 +80,41 @@ wasm_runtime_dump_pgo_prof_data_to_buf(wasm_module_inst_t module_inst, char *buf
 
 Developer can refer to the `test_pgo.sh` files under each benchmark folder for more details, e.g. [test_pgo.sh](../tests/benchmarks/coremark/test_pgo.sh) of CoreMark benchmark.
 
-## 6. Disable the memory boundary check
+### 6. Compiling WebAssembly Components (Experimental)
+
+`wamrc` now provides experimental support for Ahead-of-Time (AOT) compilation of WebAssembly Components. This allows each core module within a component to be compiled to native code. This feature sets the stage for future optimizations of cross-component calls using the Canonical ABI.
+
+#### Using the `--component` flag
+
+To instruct `wamrc` to treat the input file as a WebAssembly Component, use the `--component` flag:
+
+```bash
+# Example: Outputting to a directory (recommended for multiple modules)
+mkdir my_component_output
+wamrc --component -o my_component_output my_component.wasm
+
+# Example: Using a prefix (less common if many modules)
+# wamrc --component -o my_component_prefix my_component.wasm
+```
+
+When compiling a component:
+*   If the output path specified with `-o` is a directory, `wamrc` will place the compiled AOT/object files for each core module inside this directory (e.g., `my_component_output/my_component.wasm_module_0.o`, `my_component_output/my_component.wasm_module_1.o`).
+*   If the output path is not a directory, it will be used as a prefix for the generated files.
+*   The specific output format per module (e.g., `.o`, `.aot`, `.ll`) depends on the `--format` option provided to `wamrc`.
+
+#### Cross-Component Calls and Canonical ABI
+
+When a function imported by a module inside the component is identified as a call to another component (this identification relies on the component's structure and how imports are linked), `wamrc` generates a wrapper function. This wrapper is responsible for marshalling arguments and return values between the core WebAssembly ABI of the caller and the WebAssembly Component Model Canonical ABI expected by the callee. This process involves LIFT (core Wasm to Canonical ABI) and LOWER (Canonical ABI to core Wasm) operations.
+
+#### Current Status and Limitations
+
+*   This feature is currently **experimental**.
+*   Full LIFT/LOWER support for complex data types (strings, lists, records, variants, etc.) in cross-component call wrappers is under active development. Basic support for primitive types is in place.
+*   Memory management options defined by the Canonical ABI (e.g., `realloc` for allocating memory in the target component's memory) are foundational but their full utilization and configuration in generated wrappers are still evolving.
+*   Error handling and propagation across component boundaries via the Canonical ABI are areas of ongoing work.
+*   Currently, only direct calls to imported functions that are determined to be cross-component calls trigger wrapper generation. Indirect calls via tables may not yet fully support cross-component semantics with ABI marshalling.
+
+## 7. Disable the memory boundary check
 
 Please notice that this method is not a general solution since it may lead to security issues. And only boost the performance for some platforms in AOT mode and don't support hardware trap for memory boundary check.
 
@@ -95,7 +129,7 @@ Please notice that this method is not a general solution since it may lead to se
 
 You should only use this method for well tested wasm applications and make sure the memory access is safe.
 
-## 7. Use linux-perf
+## 8. Use linux-perf
 
 Linux perf is a powerful tool to analyze the performance of a program, developer can use it to find the hot functions and optimize them. It is one profiler supported by WAMR. In order to use it, you need to add `--perf-profile` while running _iwasm_. By default, it is disabled.
 
@@ -143,7 +177,7 @@ $ perf report --input=perf.data
 >
 > If not able to get the context of the custom name section, WAMR will use `aot_func#N` to represent the function name. `N` is from 0. `aot_func#0` represents the first _not imported wasm function_.
 
-### 7.1 Flamegraph
+### 8.1 Flamegraph
 
 [Flamegraph](https://www.brendangregg.com/flamegraphs.html) is a powerful tool to visualize stack traces of profiled software so that the most frequent code-paths can be identified quickly and accurately. In order to use it, you need to [capture graphs](https://github.com/brendangregg/FlameGraph#1-capture-stacks) when running `perf record`
 
@@ -198,11 +232,11 @@ $ ./FlameGraph/flamegraph.pl out.folded > perf.foo.wasm.svg
 > Then you will see a new file named _out.folded.translated_ which contains the translated folded stacks.
 > All wasm functions are translated to its original names with a prefix like "[Wasm]"
 
-## 8. Refine the calling processes between host native and wasm application
+## 9. Refine the calling processes between host native and wasm application
 
 In some scenarios, there may be lots of callings between host native and wasm application, e.g. frequent callings to AOT/JIT functions from host native or frequent callings to host native from AOT/JIT functions. It is important to refine these calling processes to speedup them, WAMR provides several methods:
 
-### 8.1 Refine callings to native APIs registered by `wasm_runtime_register_natives` from AOT code
+### 9.1 Refine callings to native APIs registered by `wasm_runtime_register_natives` from AOT code
 
 When wamrc compiles the wasm file to AOT code, it may generate LLVM IR to call the native API from an AOT function, and if it doesn't know the native API's signature, the generated LLVM IR has to call the runtime API `aot_invoke_native` to invoke the native API, which is a relatively slow way. If developer registers native APIs during execution by calling `wasm_runtime_register_natives` or by `iwasm --native-lib=<lib>`, then developer can also register native APIs with the same signatures to the AOT compiler by `wamrc --native-lib=<lib>`, so as to let the AOT compiler pre-know the native API's signature, and generate optimized LLVM IR to quickly call to the native API.
 
@@ -242,13 +276,13 @@ wamrc --native-lib=./libtest_add.so -o <aot_file> <wasm_file>
 
 > Note: no need to do anything for LLVM JIT since the native APIs must have been registered before execution and JIT compiler already knows the native APIs' signatures.
 
-### 8.2 Refine callings to native APIs registered by wasm-c-api `wasm_instance_new` from AOT code
+### 9.2 Refine callings to native APIs registered by wasm-c-api `wasm_instance_new` from AOT code
 
 In wasm-c-api mode, when the native APIs are registered by `wasm_instance_new(..., imports, ...)`, developer can use `wamrc --invoke-c-api-import` option to generate the AOT file, which treats the unknown import function as wasm-c-api import function and generates optimized LLVM IR to speedup the calling process.
 
 > Note: no need to do anything for LLVM JIT since the similar flag has been set to JIT compiler in wasm-c-api `wasm_engine_new` when LLVM JIT is enabled.
 
-### 8.3 Refine callings to AOT/JIT functions from host native
+### 9.3 Refine callings to AOT/JIT functions from host native
 
 Currently by default WAMR runtime has registered many quick AOT/JIT entries to speedup the calling processes to call AOT/JIT functions from host native, as long as developer doesn't disable it by using `cmake -DWAMR_BUILD_QUICK_AOT_ENTRY=0` or setting the compiler macro `WASM_ENABLE_QUICK_AOT_ENTRY` to 0 in the makefile. These quick AOT/JIT entries include:
 

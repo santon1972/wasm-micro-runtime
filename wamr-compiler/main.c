@@ -211,6 +211,7 @@ print_help()
 #endif
     printf("  --mllvm=<option>          Add the LLVM command line option\n");
     printf("  --enable-shared-heap      Enable shared heap feature\n");
+    printf("  --component               Compile the input WASM file as a WAMR Component (experimental)\n");
     printf("  -v=n                      Set log verbose level (0 to 5, default is 2), larger with more log\n");
     printf("  --version                 Show version information\n");
     printf("Examples: wamrc -o test.aot test.wasm\n");
@@ -387,14 +388,16 @@ main(int argc, char *argv[])
     size_t llvm_options_count = 0;
     uint8 *wasm_file = NULL;
     uint32 wasm_file_size;
-    wasm_module_t wasm_module = NULL;
-    aot_comp_data_t comp_data = NULL;
+    wasm_module_t wasm_module = NULL; /* For single module compilation */
+    WASMComponent *wasm_component = NULL; /* For component compilation */
+    aot_comp_data_t comp_data = NULL; /* This will be derived from wasm_module or each module in wasm_component */
     aot_comp_context_t comp_ctx = NULL;
     RuntimeInitArgs init_args;
     AOTCompOption option = { 0 };
     char error_buf[128];
     int log_verbose_level = 2;
     bool sgx_mode = false, size_level_set = false, use_dummy_wasm = false;
+    bool is_component_file = false;
     int exit_status = EXIT_FAILURE;
 #if BH_HAS_DLFCN
     const char *native_lib_list[8] = { NULL };
@@ -664,6 +667,9 @@ main(int argc, char *argv[])
             printf("wamrc %u.%u.%u\n", major, minor, patch);
             return 0;
         }
+        else if (!strcmp(argv[0], "--component")) {
+            is_component_file = true;
+        }
         else
             PRINT_HELP_AND_EXIT();
     }
@@ -771,24 +777,38 @@ main(int argc, char *argv[])
             goto fail1;
     }
 
-    if (wasm_file_size >= 4 /* length of MAGIC NUMBER */
-        && get_package_type(wasm_file, wasm_file_size)
-               != Wasm_Module_Bytecode) {
-        printf("Invalid wasm file: magic header not detected\n");
-        goto fail2;
-    }
+    if (is_component_file) {
+        printf("Attempting to load as component...\n");
+        wasm_component = wasm_component_load(wasm_file, wasm_file_size, error_buf, sizeof(error_buf));
+        if (!wasm_component) {
+            printf("Error loading component: %s\n", error_buf);
+            goto fail2;
+        }
+        // For components, AOTCompData will be created per-module inside aot_compile_component
+        // or a similar new top-level function. For now, comp_data remains NULL here.
+        // AOTCompContext will receive the wasm_component.
+        LOG_VERBOSE("Successfully loaded component file.\n");
+    } else {
+        if (wasm_file_size >= 4 /* length of MAGIC NUMBER */
+            && get_package_type(wasm_file, wasm_file_size)
+                   != Wasm_Module_Bytecode) {
+            printf("Invalid wasm file: magic header not detected\n");
+            goto fail2;
+        }
 
-    /* load WASM module */
-    if (!(wasm_module = wasm_runtime_load(wasm_file, wasm_file_size, error_buf,
-                                          sizeof(error_buf)))) {
-        printf("%s\n", error_buf);
-        goto fail2;
-    }
+        /* load WASM module */
+        if (!(wasm_module = wasm_runtime_load(wasm_file, wasm_file_size, error_buf,
+                                              sizeof(error_buf)))) {
+            printf("%s\n", error_buf);
+            goto fail2;
+        }
 
-    if (!(comp_data = aot_create_comp_data(wasm_module, option.target_arch,
-                                           option.enable_gc))) {
-        printf("%s\n", aot_get_last_error());
-        goto fail3;
+        // Will be modified later to pass component context if available (NULL for now)
+        if (!(comp_data = aot_create_comp_data(wasm_module, option.target_arch,
+                                               option.enable_gc, NULL, 0))) {
+            printf("%s\n", aot_get_last_error());
+            goto fail3;
+        }
     }
 
 #if WASM_ENABLE_DEBUG_AOT != 0
@@ -799,16 +819,30 @@ main(int argc, char *argv[])
 
     bh_print_time("Begin to create compile context");
 
-    if (!(comp_ctx = aot_create_comp_context(comp_data, &option))) {
+    // Pass wasm_component to aot_create_comp_context if it's a component compilation
+    if (!(comp_ctx = aot_create_comp_context(is_component_file ? NULL : comp_data,
+                                             is_component_file ? wasm_component : NULL,
+                                             &option))) {
         printf("%s\n", aot_get_last_error());
         goto fail4;
     }
 
     bh_print_time("Begin to compile");
 
-    if (!aot_compile_wasm(comp_ctx)) {
-        printf("%s\n", aot_get_last_error());
-        goto fail5;
+    if (is_component_file) {
+        // Note: aot_compile_component will internally iterate through component modules,
+        // create comp_data for each, and call aot_compile_wasm or similar.
+        // The final AOT file emission might also be handled within aot_compile_component
+        // or require changes to aot_emit_aot_file to understand components.
+        if (!aot_compile_component(comp_ctx, out_file_name)) { // Pass out_file_name for now
+             printf("Error compiling component: %s\n", aot_get_last_error());
+             goto fail5;
+        }
+    } else {
+        if (!aot_compile_wasm(comp_ctx)) {
+            printf("%s\n", aot_get_last_error());
+            goto fail5;
+        }
     }
 
     switch (option.output_format) {
@@ -845,12 +879,18 @@ fail5:
     aot_destroy_comp_context(comp_ctx);
 
 fail4:
-    /* Destroy compile data */
-    aot_destroy_comp_data(comp_data);
+    /* Destroy compile data (if not part of component and was created) */
+    if (comp_data) {
+        aot_destroy_comp_data(comp_data);
+        comp_data = NULL; /* Avoid double free if component compilation also uses it later */
+    }
 
 fail3:
-    /* Unload WASM module */
-    wasm_runtime_unload(wasm_module);
+    /* Unload WASM module or component */
+    if (wasm_module)
+        wasm_runtime_unload(wasm_module);
+    if (wasm_component)
+        wasm_component_unload(wasm_component);
 
 fail2:
     /* free the file buffer */

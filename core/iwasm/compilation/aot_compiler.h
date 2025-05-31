@@ -12,6 +12,7 @@
 #include "../aot/aot_runtime.h"
 /* For WASMComponent */
 #include "../interpreter/wasm_component_loader.h"
+#include "aot_component_types.h"
 
 
 #ifdef __cplusplus

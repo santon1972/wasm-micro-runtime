@@ -32,6 +32,8 @@
 #include "simd/simd_sat_int_arith.h"
 #include "../aot/aot_runtime.h"
 #include "../interpreter/wasm_opcode.h"
+/* For WASMComponent related structures */
+#include "../interpreter/wasm_component_loader.h" /* Needed for WASMComponent */
 #include <errno.h>
 
 #if WASM_ENABLE_DEBUG_AOT != 0
@@ -4108,128 +4110,200 @@ aot_compile_wasm(AOTCompContext *comp_ctx)
 
 
 bool
-aot_compile_component(WASMComponent *wasm_component, AOTCompOption *options,
-                      const char *output_dirpath)
+aot_compile_component(AOTCompContext *comp_ctx_outer, const char *output_dirpath)
 {
-    AOTCompContext *comp_ctx = NULL;
-    AOTCompData *comp_data = NULL;
+    AOTCompData *comp_data_local = NULL; // Renamed to avoid conflict
     uint32 i;
     char original_target_filename[1024] = {0};
     char module_obj_filename[1024] = {0};
     char module_ll_filename[1024] = {0}; // For LLVM IR output
+    AOTCompOption options_local = { 0 }; // Stack allocated options
 
-    if (!wasm_component || !options) {
+    WASMComponent *wasm_component = comp_ctx_outer->component_target;
+
+    if (!wasm_component || !comp_ctx_outer) { // output_dirpath can be NULL for some formats
         aot_set_last_error("invalid arguments to aot_compile_component.");
         return false;
     }
 
-    if (options->target_file) {
-        strncpy(original_target_filename, options->target_file, sizeof(original_target_filename) - 1);
-    } else {
-        // Default output name if not provided (e.g., "a.out" or component name based)
-        // This might need better handling based on how wamrc invokes this.
-        strncpy(original_target_filename, "component_aot", sizeof(original_target_filename) -1);
+    // Populate options_local from comp_ctx_outer (or its 'option' field if it exists)
+    // This assumes aot_comp_option_t is a pointer to AOTCompOption.
+    // If comp_ctx_outer directly contains option fields, copy them one by one.
+    // For simplicity, let's assume we can copy relevant fields.
+    // This is a critical step to ensure options are propagated.
+    options_local.target_arch = comp_ctx_outer->target_arch;
+    options_local.target_cpu = comp_ctx_outer->target_cpu;
+    options_local.target_abi = NULL; // Assuming target_arch and target_cpu are primary for LLVM target machine
+    if (comp_ctx_outer->target_cpu)
+        options_local.target_cpu = bh_strdup(comp_ctx_outer->target_cpu);
+
+    options_local.opt_level = comp_ctx_outer->opt_level;
+    options_local.size_level = comp_ctx_outer->size_level;
+    options_local.output_format = comp_ctx_outer->output_format;
+    options_local.bounds_checks = comp_ctx_outer->bounds_checks;
+    options_local.stack_bounds_checks = comp_ctx_outer->stack_bounds_checks;
+    options_local.enable_stack_estimation = comp_ctx_outer->enable_stack_estimation;
+    options_local.enable_bulk_memory = comp_ctx_outer->enable_bulk_memory;
+    options_local.enable_thread_mgr = comp_ctx_outer->enable_thread_mgr;
+    options_local.enable_tail_call = comp_ctx_outer->enable_tail_call;
+    options_local.enable_simd = comp_ctx_outer->enable_simd;
+    options_local.enable_ref_types = comp_ctx_outer->enable_ref_types;
+    options_local.enable_aux_stack_check = comp_ctx_outer->enable_aux_stack_check;
+    options_local.aux_stack_frame_type = comp_ctx_outer->aux_stack_frame_type;
+    memcpy(&options_local.call_stack_features, &comp_ctx_outer->call_stack_features, sizeof(AOTCallStackFeatures));
+    options_local.enable_perf_profiling = comp_ctx_outer->enable_perf_profiling;
+    options_local.enable_memory_profiling = comp_ctx_outer->enable_memory_profiling;
+    options_local.is_indirect_mode = comp_ctx_outer->is_indirect_mode;
+    options_local.disable_llvm_intrinsics = comp_ctx_outer->disable_llvm_intrinsics;
+    options_local.builtin_intrinsics = comp_ctx_outer->builtin_intrinsics; // Assuming char* that can be copied
+    options_local.disable_llvm_jump_tables = comp_ctx_outer->disable_llvm_jump_tables;
+    options_local.disable_llvm_lto = comp_ctx_outer->disable_llvm_lto;
+    options_local.enable_llvm_pgo = comp_ctx_outer->enable_llvm_pgo;
+    options_local.use_prof_file = comp_ctx_outer->use_prof_file; // Assuming char*
+    options_local.segue_flags = comp_ctx_outer->segue_flags;
+    options_local.enable_gc = comp_ctx_outer->enable_gc;
+    options_local.enable_shared_heap = comp_ctx_outer->enable_shared_heap;
+    options_local.external_llc_compiler = comp_ctx_outer->external_llc_compiler;
+    options_local.llc_compiler_flags = comp_ctx_outer->llc_compiler_flags;
+    options_local.external_asm_compiler = comp_ctx_outer->external_asm_compiler;
+    options_local.asm_compiler_flags = comp_ctx_outer->asm_compiler_flags;
+    options_local.stack_usage_file = comp_ctx_outer->stack_usage_file;
+    options_local.llvm_passes = comp_ctx_outer->llvm_passes;
+    options_local.quick_invoke_c_api_import = comp_ctx_outer->quick_invoke_c_api_import;
+    options_local.emit_frame_pointer = comp_ctx_outer->emit_frame_pointer;
+    // options_local.target_file should be set per module if needed, or handled by output_dirpath logic
+
+    // Use output_dirpath to construct the base for module filenames
+    // If output_dirpath is "component.aot", we might want "component_module_0.o" etc.
+    // For now, assuming output_dirpath is a directory, or we use a base name from it.
+    // This part might need adjustment based on how `wamrc` intends to manage output files for components.
+    // A simple approach: if output_dirpath is "path/to/mycomp.aot", use "path/to/mycomp" as base.
+    char base_filename[1024] = {0};
+    const char *actual_output_base = original_target_filename; // Default to original if not a path
+
+    if (output_dirpath) { // output_dirpath is the final component AOT filename from wamrc
+        strncpy(original_target_filename, output_dirpath, sizeof(original_target_filename) - 1);
+        char *last_slash = strrchr(original_target_filename, BH_DIR_SEPARATOR_CHAR);
+        char *last_dot = strrchr(original_target_filename, '.');
+        if (last_dot && (last_slash == NULL || last_dot > last_slash)) {
+            strncpy(base_filename, original_target_filename, last_dot - original_target_filename);
+        } else {
+            strncpy(base_filename, original_target_filename, sizeof(base_filename) -1);
+        }
+        actual_output_base = base_filename;
     }
 
-    LOG_VERBOSE("Starting AOT compilation for component with %u core modules.",
-                wasm_component->core_module_count);
+
+    LOG_VERBOSE("Starting AOT compilation for component with %u core modules. Base output: %s",
+                wasm_component->core_module_count, actual_output_base);
 
     for (i = 0; i < wasm_component->core_module_count; i++) {
         WASMComponentCoreModule *core_module_entry = &wasm_component->core_modules[i];
         WASMModule *core_wasm_module = core_module_entry->module_object;
-        char module_name_prefix[256];
+        AOTCompContext *module_comp_ctx = NULL;
+        char module_name_prefix[512]; // Increased buffer size
 
         if (!core_wasm_module) {
             aot_set_last_error_v("core module %u in component is not loaded.", i);
+            if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
             return false; 
         }
 
-        // Create a unique prefix for this module's output files
-        // This could be based on an actual module name if available from component, or just index
         snprintf(module_name_prefix, sizeof(module_name_prefix), "%s_module_%u", 
-                 original_target_filename, i);
+                 actual_output_base, i);
 
         LOG_VERBOSE("Compiling core module %u (%s) from component.", i, module_name_prefix);
 
-        comp_data = aot_create_comp_data(core_wasm_module, options->target_arch, options->gc_enabled);
-        if (!comp_data) {
+        comp_data_local = aot_create_comp_data(core_wasm_module, options_local.target_arch,
+                                               options_local.gc_enabled, wasm_component, i);
+        if (!comp_data_local) {
+             if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
             return false; 
         }
 
-        comp_ctx = aot_create_comp_context(comp_data, options);
-        if (!comp_ctx) {
-            aot_destroy_comp_data(comp_data);
+        module_comp_ctx = aot_create_comp_context(comp_data_local, wasm_component, &options_local);
+        if (!module_comp_ctx) {
+            aot_destroy_comp_data(comp_data_local);
+            if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
             return false; 
         }
-
-        comp_ctx->wasm_component = wasm_component;
-        comp_ctx->is_component_compilation = true;
         
-        // Set target_file in options for this module if aot_emit_object_file uses it
-        // Or, pass the filename directly to aot_emit_object_file if API allows
-        // For now, assuming aot_emit_object_file takes filename as argument
-        
-        if (!aot_compile_wasm(comp_ctx)) {
+        if (!aot_compile_wasm(module_comp_ctx)) {
             LOG_ERROR("Failed to compile core module %u (%s) in component: %s", i, module_name_prefix, aot_get_last_error());
-            aot_destroy_comp_context(comp_ctx); 
+            aot_destroy_comp_context(module_comp_ctx);
+            if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
             return false; 
         }
 
-        // Determine output filenames based on output_dirpath and module_name_prefix
+        // Determine output filenames based on actual_output_base
+        // If output_dirpath was provided to wamrc, it's the final component AOT file path.
+        // We should place module objects/IR in the same directory.
+        char *output_dir_for_modules = NULL;
+        char temp_path_buffer[1024];
+
         if (output_dirpath) {
-            snprintf(module_obj_filename, sizeof(module_obj_filename), "%s/%s.o",
-                     output_dirpath, module_name_prefix);
-            if (options->output_format == AOT_LLVMIR_OPT_FILE || options->output_format == AOT_LLVMIR_UNOPT_FILE) {
-                 snprintf(module_ll_filename, sizeof(module_ll_filename), "%s/%s.ll",
-                     output_dirpath, module_name_prefix);
+            strncpy(temp_path_buffer, output_dirpath, sizeof(temp_path_buffer) -1);
+            char *last_sep = strrchr(temp_path_buffer, BH_DIR_SEPARATOR_CHAR);
+            if (last_sep) {
+                *last_sep = '\0'; // Cut off filename to get directory
+                output_dir_for_modules = temp_path_buffer;
+            } else {
+                 // No directory part, use current directory
             }
-        } else { // Fallback to current directory if no output_dirpath
+        }
+
+        if (output_dir_for_modules && strcmp(output_dir_for_modules, "") != 0) {
+            snprintf(module_obj_filename, sizeof(module_obj_filename), "%s%c%s.o",
+                     output_dir_for_modules, BH_DIR_SEPARATOR_CHAR, module_name_prefix);
+            if (options_local.output_format == AOT_LLVMIR_OPT_FILE || options_local.output_format == AOT_LLVMIR_UNOPT_FILE) {
+                 snprintf(module_ll_filename, sizeof(module_ll_filename), "%s%c%s.ll",
+                     output_dir_for_modules, BH_DIR_SEPARATOR_CHAR, module_name_prefix);
+            }
+        } else {
             snprintf(module_obj_filename, sizeof(module_obj_filename), "%s.o", module_name_prefix);
-             if (options->output_format == AOT_LLVMIR_OPT_FILE || options->output_format == AOT_LLVMIR_UNOPT_FILE) {
+             if (options_local.output_format == AOT_LLVMIR_OPT_FILE || options_local.output_format == AOT_LLVMIR_UNOPT_FILE) {
                  snprintf(module_ll_filename, sizeof(module_ll_filename), "%s.ll", module_name_prefix);
             }
         }
 
-        if (options->output_format == AOT_OBJECT_FILE) {
-            if (!aot_emit_object_file(comp_ctx, module_obj_filename)) {
+
+        if (options_local.output_format == AOT_OBJECT_FILE) {
+            if (!aot_emit_object_file(module_comp_ctx, module_obj_filename)) {
                 LOG_ERROR("Failed to emit object file for core module %u (%s): %s", i, module_name_prefix, aot_get_last_error());
-                aot_destroy_comp_context(comp_ctx);
+                aot_destroy_comp_context(module_comp_ctx);
+                if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
                 return false;
             }
             LOG_VERBOSE("Successfully compiled core module %u to %s", i, module_obj_filename);
-        } else if (options->output_format == AOT_LLVMIR_OPT_FILE || options->output_format == AOT_LLVMIR_UNOPT_FILE) {
-            if (!aot_emit_llvm_file(comp_ctx, module_ll_filename)) {
+        } else if (options_local.output_format == AOT_LLVMIR_OPT_FILE || options_local.output_format == AOT_LLVMIR_UNOPT_FILE) {
+            if (!aot_emit_llvm_file(module_comp_ctx, module_ll_filename)) {
                  LOG_ERROR("Failed to emit LLVM IR file for core module %u (%s): %s", i, module_name_prefix, aot_get_last_error());
-                aot_destroy_comp_context(comp_ctx);
+                aot_destroy_comp_context(module_comp_ctx);
+                if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
                 return false;
             }
             LOG_VERBOSE("Successfully compiled core module %u to %s", i, module_ll_filename);
         }
         // Note: AOT_FORMAT_FILE for components is not handled here yet, would require merging.
 
-        aot_destroy_comp_context(comp_ctx); 
-        comp_ctx = NULL;
-        // comp_data is freed by aot_destroy_comp_context
+        aot_destroy_comp_context(module_comp_ctx);
+        // comp_data_local is freed by aot_destroy_comp_context
     }
     
     LOG_VERBOSE("Finished compiling all core modules. Processing canonicals and exports (placeholders).");
 
-    for (i = 0; i < wasm_component->canonical_count; ++i) {
-        WASMComponentCanonical *canon = &wasm_component->canonicals[i];
-        LOG_VERBOSE("Canonical function %u: kind %s, core_func_idx %u, component_func_type_idx %u",
-                    i, canon->func_kind == CANONICAL_FUNC_KIND_LIFT ? "lift" : "lower",
-                    canon->core_func_idx, canon->component_func_type_idx);
+    // Placeholder: Actual component linking and final AOT file generation would happen here or after.
+    // This might involve creating a new top-level LLVM module for the component itself,
+    // linking in the object files of core modules, and adding component-specific metadata/runtime.
+    // For now, we just compile each core module.
+    if (options_local.output_format == AOT_FORMAT_FILE) {
+        // This part needs significant work for components.
+        // It would involve taking all compiled module objects (or their AOT sections)
+        // and packaging them into a single component AOT file.
+        // For now, just log that it's not fully implemented.
+        LOG_WARNING("Component AOT output format (single .aot file for component) is not yet fully implemented. Individual module objects/IR may have been created.");
     }
-
-    for (i = 0; i < wasm_component->export_count; ++i) {
-        WASMComponentExport *export_entry = &wasm_component->exports[i];
-        LOG_VERBOSE("Component export %u: name '%s', kind %u, item_idx %u, type_idx %u",
-                    i, export_entry->name, export_entry->kind, export_entry->item_idx, export_entry->optional_desc_type_idx);
-    }
-
-    // TODO: Link individual core module object files and component runtime into a single component AOT file.
-    LOG_VERBOSE("Component AOT compilation (core modules) complete. Linking and wrapper generation are future steps.");
-
+    if(options_local.target_cpu) wasm_runtime_free((void*)options_local.target_cpu);
     return true;
 }
 

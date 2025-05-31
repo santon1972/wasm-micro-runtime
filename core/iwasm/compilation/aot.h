@@ -199,6 +199,12 @@ typedef struct AOTImportFunc {
     bool call_conv_raw;
     bool call_conv_wasm_c_api;
     bool wasm_c_api_with_env;
+    /* true if this import function is a call to a function in another component */
+    bool is_cross_component_call;
+    /* Canonical ABI options, -1 or invalid index if not specified */
+    int32 canon_memory_idx;
+    int32 canon_realloc_func_idx;
+    /* TODO: Add other canonical options like string encoding if needed here */
 } AOTImportFunc;
 
 /**
@@ -306,7 +312,8 @@ typedef struct AOTNativeSymbol {
 
 AOTCompData *
 aot_create_comp_data(WASMModule *module, const char *target_arch,
-                     bool gc_enabled);
+                     bool gc_enabled, struct WASMComponent *parent_component,
+                     uint32 module_idx_in_component);
 
 void
 aot_destroy_comp_data(AOTCompData *comp_data);

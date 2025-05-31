@@ -37,6 +37,9 @@
 #include "aot_orc_extra.h"
 #include "aot_comp_option.h"
 
+/* Forward declaration for WASMComponent */
+struct WASMComponent;
+
 #if defined(_WIN32) || defined(_WIN32_)
 #include <io.h>
 #define access _access
@@ -377,6 +380,9 @@ typedef struct AOTLLVMConsts {
  */
 typedef struct AOTCompContext {
     const AOTCompData *comp_data;
+    /* Component Model specific data */
+    struct WASMComponent *component_target; /* Target component, if compiling a component */
+    bool is_component_compilation;          /* True if compiling a module as part of a component */
 
     /* LLVM variables required to emit LLVM IR */
     LLVMContextRef context;
