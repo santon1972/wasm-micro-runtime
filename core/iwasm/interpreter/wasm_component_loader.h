@@ -305,7 +305,9 @@ typedef enum WASMAliasSort {
     ALIAS_SORT_CORE_MODULE = 0x04, /* When aliasing a core module itself */
     ALIAS_SORT_TYPE = 0x05,
     ALIAS_SORT_COMPONENT = 0x06,
-    /* ALIAS_SORT_INSTANCE, ALIAS_SORT_VALUE etc. can be added */
+    ALIAS_SORT_INSTANCE = 0x07,    /* Instance of a component */
+    ALIAS_SORT_VALUE = 0x08        /* A value (e.g. from a value section, or a func producing a value) */
+    /* Potentially other sorts can be added */
 } WASMAliasSort;
 
 

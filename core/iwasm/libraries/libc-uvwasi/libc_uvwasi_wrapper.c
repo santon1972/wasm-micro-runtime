@@ -6,6 +6,10 @@
 #include "uvwasi.h"
 #include "bh_platform.h"
 #include "wasm_export.h"
+#include "wasm_runtime_common.h" // For wasm_runtime_get_wasi_ctx, etc.
+#include "wasi_async_defs.h"     // New header for async types
+#include "wasm_component_canonical.h" // For global_resource_table access (WARN: consider alternatives)
+#include <time.h>                 // For timespec_get (if needed for timeouts)
 
 /* clang-format off */
 #define get_module_inst(exec_env) \
@@ -1122,6 +1126,303 @@ wasi_sched_yield(wasm_exec_env_t exec_env)
     return uvwasi_sched_yield(uvwasi);
 }
 
+// --- Start of WASI Async Host Function Implementations ---
+
+// Helper to safely retrieve a resource by handle
+// TODO: This should ideally use a type-safe mechanism or type tag check from wasm_component_canonical.c
+// For now, this is a simplified local version.
+static void*
+get_async_resource_data(WASMModuleInstance *module_inst, uint32_t handle,
+                        const char *resource_name_for_log,
+                        char *error_buf, uint32_t error_buf_size)
+{
+    // This function would typically interact with the component's resource management.
+    // For now, it's a placeholder. The actual resource table is in wasm_component_canonical.c
+    // and not directly accessible here without proper linkage or context.
+    // This highlights the need for a clear API to manage resources from host functions.
+    LOG_TODO("get_async_resource_data: Needs proper integration with component resource management.");
+    if (handle == 0) { // Simplified check
+        snprintf(error_buf, error_buf_size, "Invalid %s handle: %u (null handle)", resource_name_for_log, handle);
+        return NULL;
+    }
+    // Placeholder: return NULL until proper resource lookup is implemented.
+    // Real implementation would look up in a table associated with module_inst or a global table.
+    // snprintf(error_buf, error_buf_size, "Resource lookup for %s handle %u not yet implemented.", resource_name_for_log, handle);
+    // return NULL;
+    // TEMPORARY: Assuming direct access for stubbing, replace with proper API.
+    if (handle >= MAX_RESOURCE_HANDLES || !global_resource_table[handle].is_active) {
+         snprintf(error_buf, error_buf_size, "Invalid or inactive %s handle: %u", resource_name_for_log, handle);
+         return NULL;
+    }
+    return global_resource_table[handle].host_data;
+}
+
+
+// --- Destructors for Async Resources ---
+// These are callable via resource.drop
+void destroy_wamr_pollable(void *pollable_resource_data) {
+    wamr_wasi_pollable_t *pollable = (wamr_wasi_pollable_t*)pollable_resource_data;
+    if (!pollable) return;
+
+    LOG_VERBOSE("Destroying pollable (Wasm handle %u, type %d)", pollable->wasm_resource_handle, pollable->type);
+
+    if (pollable->type == POLLABLE_TYPE_FD_READ || pollable->type == POLLABLE_TYPE_FD_WRITE) {
+        if (uv_is_active((uv_handle_t*)&pollable->data.fd_poll.poll_watcher)) {
+            uv_poll_stop(&pollable->data.fd_poll.poll_watcher);
+            // uv_close typically not needed for uv_poll_t if just stopping
+        }
+    } else if (pollable->type == POLLABLE_TYPE_TIMEOUT) {
+        if (uv_is_active((uv_handle_t*)&pollable->data.timeout.timer_handle)) {
+            uv_timer_stop(&pollable->data.timeout.timer_handle);
+            // uv_close for timers is more common if they are dynamically allocated parts of the handle
+        }
+    }
+    // POLLABLE_TYPE_FUTURE pollables are typically owned by the future, not dropped independently by Wasm.
+    // POLLABLE_TYPE_STREAM_READ/WRITE are owned by streams.
+    bh_free(pollable);
+}
+
+void destroy_wamr_future(void *future_resource_data) {
+    wamr_wasi_future_t *future_base = (wamr_wasi_future_t*)future_resource_data;
+    if (!future_base) return;
+    LOG_VERBOSE("Destroying future (Wasm handle %u, state %d)", future_base->wasm_resource_handle, future_base->state);
+
+    if (future_base->state == FUTURE_STATE_PENDING && future_base->work_req.data != NULL) {
+        // uv_cancel can be tricky. Only for specific request types.
+        // For uv_work_t, there is no direct cancellation of the work queue task once started.
+        LOG_WARNING("Future (Wasm handle %u) destroyed while work_req was pending; cancellation of uv_work_t is not directly supported.", future_base->wasm_resource_handle);
+    }
+    if (future_base->internal_ctx) {
+        // Example: if internal_ctx was a uv_fs_t for an async file operation
+        // uv_fs_req_cleanup((uv_fs_t*)future_base->internal_ctx);
+        // bh_free(future_base->internal_ctx); // Free the request structure itself
+        LOG_TODO("Future %u: Type-specific cleanup of internal_ctx needed.", future_base->wasm_resource_handle);
+    }
+
+    // The associated result_pollable is part of the future structure if created by the host internally,
+    // or it's a separate resource if created via future_subscribe.
+    // If pollable is part of future struct (not separate resource):
+    // if (future_base->result_pollable && future_base->result_pollable->wasm_resource_handle == 0) {
+    //    destroy_wamr_pollable(future_base->result_pollable); // Call its destructor
+    //    bh_free(future_base->result_pollable);
+    // }
+    // If future->result_pollable points to a registered WAMR resource, that resource will be dropped separately by Wasm.
+    // For now, assume future's pollable is intrinsic and not separately dropped by Wasm unless explicitly created by subscribe.
+    // If the pollable was created by future_subscribe, it's a separate resource.
+    // If it was implicitly created with the future, it might be part of the future's memory block.
+    // The current design in wasi_async_defs.h has result_pollable as a pointer.
+    // Let's assume if wasm_resource_handle on pollable is 0, it's an intrinsic part to be freed with future.
+
+    // Specific future types might have more to free, e.g. future_bytes_error_t->ok_value.bytes
+    // This generic destructor can only free common parts.
+    // TODO: Consider type-specific destructors registered with resource system.
+    bh_free(future_base);
+}
+
+// Dummy close callback for libuv handles
+static void on_uv_handle_closed_cb(uv_handle_t* handle) {
+    LOG_VERBOSE("uv_handle_t %p closed and freed.", handle);
+    bh_free(handle); // Free the handle itself if dynamically allocated
+}
+
+void destroy_wamr_input_stream(void *stream_resource_data) {
+    wamr_wasi_input_stream_t *stream = (wamr_wasi_input_stream_t*)stream_resource_data;
+    if (!stream) return;
+    LOG_VERBOSE("Destroying input stream (Wasm handle %u, type %d, state %d)", stream->wasm_resource_handle, stream->type, stream->state);
+
+    if ((stream->type == STREAM_TYPE_PIPE || stream->type == STREAM_TYPE_TCP) && stream->handle.uv_s) {
+        if (!uv_is_closing((uv_handle_t*)stream->handle.uv_s)) {
+            LOG_VERBOSE("Closing uv_stream_t %p for input stream %u.", (void*)stream->handle.uv_s, stream->wasm_resource_handle);
+            // Pass a callback that can free the uv_stream_t handle itself if it was heap allocated.
+            // If it's part of wamr_wasi_input_stream_t struct, NULL cb might be fine.
+            // Assuming uv_s points to a separately allocated handle for now.
+            uv_close((uv_handle_t*)stream->handle.uv_s, on_uv_handle_closed_cb);
+        }
+    } else if (stream->type == STREAM_TYPE_FD) {
+        // FD lifecycle usually managed by uvwasi context or externally
+        LOG_VERBOSE("Input stream %u (FD type) destroyed. Underlying FD %d not closed by this destructor.", stream->wasm_resource_handle, stream->handle.host_fd);
+    }
+    if (stream->read_pollable) { // This pollable is owned by the stream struct
+        destroy_wamr_pollable(stream->read_pollable); // Clean up its internals
+        bh_free(stream->read_pollable);
+    }
+    bh_free(stream);
+}
+
+void destroy_wamr_output_stream(void *stream_resource_data) {
+    wamr_wasi_output_stream_t *stream = (wamr_wasi_output_stream_t*)stream_resource_data;
+    if (!stream) return;
+    LOG_VERBOSE("Destroying output stream (Wasm handle %u, type %d, state %d)", stream->wasm_resource_handle, stream->type, stream->state);
+
+    if ((stream->type == STREAM_TYPE_PIPE || stream->type == STREAM_TYPE_TCP) && stream->handle.uv_s) {
+         if (!uv_is_closing((uv_handle_t*)stream->handle.uv_s)) {
+            LOG_VERBOSE("Closing uv_stream_t %p for output stream %u.", (void*)stream->handle.uv_s, stream->wasm_resource_handle);
+            uv_close((uv_handle_t*)stream->handle.uv_s, on_uv_handle_closed_cb);
+        }
+    } else if (stream->type == STREAM_TYPE_FD) {
+        LOG_VERBOSE("Output stream %u (FD type) destroyed. Underlying FD %d not closed by this destructor.", stream->wasm_resource_handle, stream->handle.host_fd);
+    }
+     if (stream->write_pollable) { // Owned by stream
+        destroy_wamr_pollable(stream->write_pollable);
+        bh_free(stream->write_pollable);
+    }
+    bh_free(stream);
+}
+
+
+// --- wasi:poll/poll.poll_list --- (Simplified non-blocking check)
+// Signature: (list_of_pollable_handles_ptr: ptr, num_pollables: i32,
+//             results_list_ptr: ptr_out(u8), num_results_written_ptr: ptr_out(i32)) -> errno
+static int32_t
+wasi_poll_list_pollables(wasm_exec_env_t exec_env, uint32_t list_of_pollable_handles_ptr, uint32_t num_pollables,
+                         uint32_t results_list_ptr, uint32_t* num_results_written_ptr) // This is native ptr
+{
+    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
+    char error_buf[128]; // For get_async_resource_data
+
+    // Validate pointers
+    if (!wasm_runtime_validate_app_addr(module_inst, list_of_pollable_handles_ptr, num_pollables * sizeof(uint32_t))
+        || !wasm_runtime_validate_app_addr(module_inst, results_list_ptr, num_pollables * sizeof(uint8_t)) /* Spec returns list<u32> of indices */
+        || !wasm_runtime_validate_native_addr(num_results_written_ptr, sizeof(uint32_t))) { /* num_results_written_ptr is native */
+        LOG_ERROR("poll_list_pollables: Invalid memory access for arguments.");
+        wasm_runtime_set_exception(module_inst, "wasi_error_fault"); // Using text for now
+        return UVWASI_EFAULT;
+    }
+
+    uint32_t *wasm_pollable_handles = wasm_runtime_addr_app_to_native(module_inst, list_of_pollable_handles_ptr);
+    // The spec says `list<u32>` for results (indices of ready pollables).
+    uint32_t *wasm_results_indices = wasm_runtime_addr_app_to_native(module_inst, results_list_ptr);
+    uint32_t results_count = 0;
+
+    LOG_VERBOSE("poll_list_pollables: Checking %u pollables.", num_pollables);
+
+    for (uint32_t i = 0; i < num_pollables; ++i) {
+        uint32_t pollable_handle = wasm_pollable_handles[i];
+        wamr_wasi_pollable_t *pollable = (wamr_wasi_pollable_t*)get_async_resource_data(
+            module_inst, pollable_handle, "pollable", error_buf, sizeof(error_buf));
+
+        if (!pollable) {
+            LOG_ERROR("poll_list_pollables: Failed to get pollable for handle %u: %s", pollable_handle, error_buf);
+            wasm_runtime_set_exception(module_inst, "wasi_error_badf");
+            return UVWASI_EBADF;
+        }
+
+        if (pollable->ready) {
+            // Spec: results list<u32> contains indices of pollables in input list that are ready
+            if (results_count < num_pollables) { // results_list_ptr has space for num_pollables u32s
+                wasm_results_indices[results_count] = i;
+                results_count++;
+                LOG_VERBOSE("Pollable handle %u (input index %u) is ready.", pollable_handle, i);
+                // TODO: Consider when to reset pollable->ready. If poll_oneoff is edge-triggered, reset here.
+                // If level-triggered, reset when the underlying condition is consumed (e.g., future_get_value).
+                // For now, let's assume level-triggered for futures/streams, and edge for simple FD/timeout.
+                if (pollable->type == POLLABLE_TYPE_FD_READ || pollable->type == POLLABLE_TYPE_FD_WRITE || pollable->type == POLLABLE_TYPE_TIMEOUT) {
+                    // pollable->ready = false; // Reset for one-shot type events
+                }
+            } else {
+                LOG_WARNING("poll_list_pollables: Exceeded result capacity (should not happen if sized to num_pollables).");
+                break;
+            }
+        }
+    }
+
+    *num_results_written_ptr = results_count;
+    LOG_VERBOSE("poll_list_pollables: Found %u ready pollables.", results_count);
+    return UVWASI_ESUCCESS;
+}
+
+// --- wasi:io/streams.read --- (Async version)
+// Placeholder signature, needs proper component model translation
+// uint32_t wasi_streams_read_async(wasm_exec_env_t exec_env, uint32_t stream_handle, uint64_t max_bytes, uint32_t future_handle_ptr)
+static int32_t /* error code */
+wasi_streams_read_async(wasm_exec_env_t exec_env, uint32_t stream_handle, uint64_t max_bytes_to_read,
+                   uint32_t* out_future_handle_ptr) // Native pointer to write the future handle
+{
+    LOG_TODO("streams_read_async: Full implementation with libuv and future fulfillment needed.");
+    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
+    char error_buf[128];
+
+    if(!wasm_runtime_validate_native_addr(out_future_handle_ptr, sizeof(uint32_t))) {
+        LOG_ERROR("streams_read_async: Invalid out_future_handle_ptr.");
+        wasm_runtime_set_exception(module_inst, "wasi_error_fault");
+        return UVWASI_EFAULT;
+    }
+    *out_future_handle_ptr = 0; // Default to invalid handle
+
+    wamr_wasi_input_stream_t *stream = (wamr_wasi_input_stream_t*)get_async_resource_data(
+        module_inst, stream_handle, "input stream", error_buf, sizeof(error_buf));
+    if (!stream) {
+        wasm_runtime_set_exception(module_inst, "wasi_error_badf");
+        return UVWASI_EBADF;
+    }
+    // TODO: Create future, register it, setup uv_read_start, return future handle
+    LOG_WARNING("streams_read_async for stream %u (max_bytes %llu) is a STUB.", stream_handle, max_bytes_to_read);
+    return UVWASI_ESUCCESS; // Placeholder
+}
+
+// --- wasi:futures/poll.subscribe ---
+// uint32_t wasi_future_subscribe(wasm_exec_env_t exec_env, uint32_t future_handle, uint32_t pollable_handle_ptr)
+static int32_t /* error code */
+wasi_future_subscribe(wasm_exec_env_t exec_env, uint32_t future_handle,
+                 uint32_t* out_pollable_handle_ptr) // Native pointer
+{
+    LOG_TODO("future_subscribe: Full implementation needed.");
+    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
+    char error_buf[128];
+
+    if(!wasm_runtime_validate_native_addr(out_pollable_handle_ptr, sizeof(uint32_t))) {
+        LOG_ERROR("future_subscribe: Invalid out_pollable_handle_ptr.");
+        wasm_runtime_set_exception(module_inst, "wasi_error_fault");
+        return UVWASI_EFAULT;
+    }
+    *out_pollable_handle_ptr = 0; // Default to invalid
+
+    wamr_wasi_future_t *future = (wamr_wasi_future_t*)get_async_resource_data(
+        module_inst, future_handle, "future", error_buf, sizeof(error_buf));
+    if (!future) {
+        wasm_runtime_set_exception(module_inst, "wasi_error_badf");
+        return UVWASI_EBADF;
+    }
+    if (!future->result_pollable) {
+        LOG_ERROR("future_subscribe: Future %u has no result_pollable associated.", future_handle);
+        wasm_runtime_set_exception(module_inst, "wasi_error_internal"); // Internal error
+        return UVWASI_EIO;
+    }
+
+    // If future->result_pollable is part of the future struct and not a separate resource yet,
+    // it needs to be registered now if subscribe implies it becomes a standalone handle.
+    // For now, assume future->result_pollable is always registered if it's meant to be returned.
+    if (future->result_pollable->wasm_resource_handle == 0) {
+         LOG_ERROR("future_subscribe: Future %u result_pollable is not a registered resource.", future_handle);
+         wasm_runtime_set_exception(module_inst, "wasi_error_internal");
+         return UVWASI_EIO;
+    }
+
+    *out_pollable_handle_ptr = future->result_pollable->wasm_resource_handle;
+    LOG_VERBOSE("future_subscribe: Future %u subscribed, returning pollable handle %u.", future_handle, *out_pollable_handle_ptr);
+    return UVWASI_ESUCCESS;
+}
+
+// Stubs for other functions that will be added to native_symbols
+static int32_t wasi_streams_write_async(wasm_exec_env_t exec_env, uint32_t stream_h, uint32_t bytes_ptr, uint32_t bytes_len, uint32_t* out_future_ptr) {
+    LOG_TODO("STUB: wasi_streams_write_async");
+    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
+    if(!wasm_runtime_validate_native_addr(out_future_ptr, sizeof(uint32_t))) { return UVWASI_EFAULT; }
+    *out_future_ptr = 0;
+    return UVWASI_ESUCCESS;
+}
+static int32_t wasi_stream_close_input(wasm_exec_env_t exec_env, uint32_t stream_h) { LOG_TODO("STUB: wasi_stream_close_input"); return UVWASI_ESUCCESS; }
+static int32_t wasi_stream_close_output(wasm_exec_env_t exec_env, uint32_t stream_h) { LOG_TODO("STUB: wasi_stream_close_output"); return UVWASI_ESUCCESS; }
+static int32_t wasi_future_get_value_and_dispose(wasm_exec_env_t exec_env, uint32_t future_h, uint32_t out_option_result_ptr) {
+    LOG_TODO("STUB: wasi_future_get_value_and_dispose");
+    // This would write an option<result<V,E>> to Wasm memory
+    return UVWASI_ESUCCESS;
+}
+
+
+// --- End of WASI Async Host Function Implementations ---
+
+
 /* clang-format off */
 #define REG_NATIVE_FUNC(func_name, signature) \
     { #func_name, wasi_##func_name, signature, NULL }
@@ -1173,6 +1474,42 @@ static NativeSymbol native_symbols_libc_wasi[] = {
     REG_NATIVE_FUNC(sock_send, "(i*ii*)i"),
     REG_NATIVE_FUNC(sock_shutdown, "(ii)i"),
     REG_NATIVE_FUNC(sched_yield, "()i"),
+
+    /* WASI Async functions */
+    // Module names in the first arg of REG_NATIVE_FUNC are illustrative of WIT paths.
+    // The actual import module name used by Wasm will be "wasi:*" or what the component defines.
+    // Signatures are placeholders and need to accurately reflect the C function signature
+    // and how Wasm will see it (e.g., pointers become i32).
+    // The C function names (e.g., wasi_poll_list_pollables) must match the second arg to REG_NATIVE_FUNC (after macro prefix).
+
+    // Interface: wasi:poll/poll@0.2.0 (example names, adjust to final WIT)
+    // Actual C function is wasi_poll_list_pollables due to REG_NATIVE_FUNC macro.
+    // Signature: list<pollable> -> result<list<u32>>
+    // Simplified C: (wasm_ptr_to_list_of_handles, num_handles, wasm_ptr_to_results_list, ptr_to_num_results_written) -> errno
+    REG_NATIVE_FUNC(poll_list_pollables, "(iiii*)i"),
+
+    // Interface: wasi:io/streams@0.2.0
+    // read: func(self: input-stream, len: u64) -> result<tuple<list<u8>, stream-status>, error-code>
+    // This becomes an async host function returning a future handle.
+    // Simplified C: (stream_handle, max_bytes, ptr_to_out_future_handle) -> errno
+    REG_NATIVE_FUNC(streams_read_async, "(iI*i)i"),
+    // write: func(self: output-stream, buf: list<u8>) -> result<tuple<u64, stream-status>, error-code>
+    // Simplified C: (stream_handle, bytes_ptr, bytes_len, ptr_to_out_future_handle) -> errno
+    REG_NATIVE_FUNC(streams_write_async, "(ii*i*i)i"),
+    // close-input-stream: func(self: input-stream) -> result<_, error-code>
+    // Simplified C: (stream_handle) -> errno
+    REG_NATIVE_FUNC(stream_close_input, "(i)i"),
+    // close-output-stream: func(self: output-stream) -> result<_, error-code>
+    // Simplified C: (stream_handle) -> errno
+    REG_NATIVE_FUNC(stream_close_output, "(i)i"),
+
+    // Interface: wasi:futures/poll@0.2.0 (or wasi:io/futures)
+    // subscribe-to-future: func(self: future<T>) -> pollable
+    // Simplified C: (future_handle, ptr_to_out_pollable_handle) -> errno
+    REG_NATIVE_FUNC(future_subscribe, "(ii*)i"),
+    // get-and-dispose-future: func(self: future<T>) -> option<result<T, E>> (actual type depends on T, E)
+    // Simplified C: (future_handle, wasm_ptr_for_option_result) -> errno
+    REG_NATIVE_FUNC(future_get_value_and_dispose, "(ii*)i")
 };
 
 uint32

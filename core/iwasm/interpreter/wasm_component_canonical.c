@@ -231,6 +231,48 @@ invalid_utf8:
 }
 // END: UTF-16 Transcoding Helpers
 
+// Helper to check if a UTF-8 string can be encoded as Latin-1
+// and get its length if so.
+static bool
+can_encode_as_latin1(const char *utf8_str, uint32 utf8_len_bytes, uint32 *out_latin1_len)
+{
+    uint32 char_count = 0;
+    uint32 utf8_idx = 0;
+    while (utf8_idx < utf8_len_bytes) {
+        uint32 code_point;
+        uint8 c1 = utf8_str[utf8_idx];
+        uint32 consumed_utf8_bytes = 0;
+
+        if (c1 < 0x80) { // ASCII
+            code_point = c1; consumed_utf8_bytes = 1;
+        } else if ((c1 & 0xE0) == 0xC0) { // 2-byte sequence
+            if (utf8_idx + 1 >= utf8_len_bytes) return false; // Incomplete sequence
+            uint8 c2 = utf8_str[utf8_idx + 1];
+            if ((c2 & 0xC0) != 0x80) return false; // Invalid sequence
+            code_point = ((c1 & 0x1F) << 6) | (c2 & 0x3F); consumed_utf8_bytes = 2;
+        } else if ((c1 & 0xF0) == 0xE0) { // 3-byte sequence
+            if (utf8_idx + 2 >= utf8_len_bytes) return false; // Incomplete sequence
+            uint8 c2 = utf8_str[utf8_idx + 1]; uint8 c3 = utf8_str[utf8_idx + 2];
+            if ((c2 & 0xC0) != 0x80 || (c3 & 0xC0) != 0x80) return false; // Invalid sequence
+            code_point = ((c1 & 0x0F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F); consumed_utf8_bytes = 3;
+        } else if ((c1 & 0xF8) == 0xF0) { // 4-byte sequence
+             // Characters requiring 4 UTF-8 bytes are outside Latin-1 range.
+            return false;
+        } else { // Invalid UTF-8 start byte
+            return false;
+        }
+
+        if (code_point >= 0x100) { // Check if character is outside Latin-1 range (0-255)
+            return false;
+        }
+        char_count++;
+        utf8_idx += consumed_utf8_bytes;
+    }
+    *out_latin1_len = char_count;
+    return true;
+}
+
+
 // Helper to convert primitive value type enum to string for error messages
 static const char* primitive_val_type_to_string(WASMComponentPrimValType ptype) {
     switch (ptype) {
@@ -421,22 +463,68 @@ wasm_component_canon_lift_value(
                         return false;
                     }
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
-                    // TODO: Implement inspection and transcoding for Latin1+UTF16
-                    LOG_WARNING("String lifting for Latin1+UTF16: Currently treating as UTF-8 if it were Latin1, or potentially misinterpreting if it's UTF-16. Full support pending.");
-                    // Fallback to UTF-8 like behavior for now, or specific error.
-                    // For now, let's be explicit this is not fully supported.
-                    // Duplicating UTF-8 logic here as a placeholder for "treat as bytes"
-                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, length)) {
-                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for Latin1+UTF16 (treated as bytes) string at offset %u, length %u", offset, length);
+                {
+                    bool decode_as_latin1 = false;
+                    uint8 *wasm_bytes_ptr = core_mem_base + offset;
+                    uint32 wasm_byte_length = length; // length is in bytes for latin1+utf16 lifting
+
+                    if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, offset, wasm_byte_length)) {
+                        set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for Latin1+UTF16 string at offset %u, length %u", offset, wasm_byte_length);
                         return false;
                     }
-                    lifted_str_len_bytes = length; // Assuming length is bytes for this path
-                    lifted_str_ptr = loader_malloc(lifted_str_len_bytes + 1, error_buf, error_buf_size);
-                    if (!lifted_str_ptr) return false;
-                    bh_memcpy_s(lifted_str_ptr, lifted_str_len_bytes + 1, core_mem_base + offset, length);
-                    lifted_str_ptr[lifted_str_len_bytes] = '\0';
-                    // set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
-                    // return false;
+
+                    if (wasm_byte_length % 2 != 0) { // Odd length
+                        decode_as_latin1 = true;
+                    } else {
+                        // Even length, check for surrogates
+                        for (uint32 i = 0; i < wasm_byte_length / 2; ++i) {
+                            uint16 val = wasm_bytes_ptr[2 * i] | (wasm_bytes_ptr[2 * i + 1] << 8);
+                            if (val >= 0xD800 && val <= 0xDFFF) {
+                                decode_as_latin1 = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (decode_as_latin1) {
+                        LOG_VERBOSE("Lifting string (latin1+utf16) as Latin1 from offset %u, %u bytes", offset, wasm_byte_length);
+                        // Max 2 bytes per Latin-1 char when converting to UTF-8 + null terminator
+                        uint32 max_utf8_len = wasm_byte_length * 2;
+                        lifted_str_ptr = loader_malloc(max_utf8_len + 1, error_buf, error_buf_size);
+                        if (!lifted_str_ptr) return false;
+
+                        uint32 utf8_idx = 0;
+                        for (uint32 i = 0; i < wasm_byte_length; ++i) {
+                            uint8 latin1_char = wasm_bytes_ptr[i];
+                            if (latin1_char < 0x80) { // ASCII
+                                if (utf8_idx < max_utf8_len) lifted_str_ptr[utf8_idx++] = latin1_char; else goto latin1_buffer_overflow;
+                            } else { // Non-ASCII Latin-1
+                                if (utf8_idx + 1 < max_utf8_len) {
+                                    lifted_str_ptr[utf8_idx++] = 0xC0 | (latin1_char >> 6);
+                                    lifted_str_ptr[utf8_idx++] = 0x80 | (latin1_char & 0x3F);
+                                } else goto latin1_buffer_overflow;
+                            }
+                        }
+                        lifted_str_ptr[utf8_idx] = '\0';
+                        lifted_str_len_bytes = utf8_idx;
+                    } else { // Decode as UTF-16LE
+                        LOG_VERBOSE("Lifting string (latin1+utf16) as UTF-16LE from offset %u, %u bytes (%u code units)", offset, wasm_byte_length, wasm_byte_length / 2);
+                        uint32 utf16_code_units = wasm_byte_length / 2;
+                        // wasm_runtime_validate_app_addr was already called for wasm_byte_length
+                        lifted_str_ptr = transcode_utf16le_to_utf8_on_host(
+                            (const uint16*)wasm_bytes_ptr, utf16_code_units,
+                            &lifted_str_len_bytes, error_buf, error_buf_size);
+                        if (!lifted_str_ptr) {
+                            // Error set by transcoder or if validation failed (though it shouldn't here)
+                            return false;
+                        }
+                    }
+                    break; // Break from the string_encoding switch
+latin1_buffer_overflow:
+                    loader_free(lifted_str_ptr);
+                    set_canon_error(error_buf, error_buf_size, "Buffer overflow during Latin1 to UTF-8 transcoding for string lifting.");
+                    return false;
+                }
                 } else {
                      set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option: %d", string_encoding);
                      return false;
@@ -975,36 +1063,8 @@ wasm_component_canon_lift_value(
         // flags could be seen as a fixed-size array of u32s, so uint32_t* seems appropriate.
         *lifted_component_value_ptr = host_flags_array;
         return true;
-    }  else if (source_component_valtype->kind == VAL_TYPE_KIND_FLAGS) {
-        // component_value_ptr points to the host-side uint32_t* array.
-        // core_value_write_ptr is where the i32(s) should be written in Wasm memory.
-        // target_core_wasm_type is not directly used here as flags map to a sequence of i32s.
-
-        uint32 label_count = source_component_valtype->u.flags.label_count;
-        if (label_count == 0) {
-            // No data to write for zero flags. core_value_write_ptr might not even be valid if size is 0.
-            return true;
-        }
-
-        uint32 num_i32s = (label_count + 31) / 32;
-        uint32 total_size_bytes = num_i32s * sizeof(uint32);
-
-        if (!component_value_ptr) {
-            set_canon_error(error_buf, error_buf_size, "Flags lowering received null component_value_ptr for non-empty flags.");
-            return false;
-        }
-        if (!core_value_write_ptr) {
-             set_canon_error(error_buf, error_buf_size, "Flags lowering received null core_value_write_ptr for non-empty flags.");
-            return false;
-        }
-        
-        // LOG_TODO: Direct memory validation for flags lowering to core_value_write_ptr is complex
-        // as it requires knowing the Wasm app_offset that core_value_write_ptr corresponds to
-        // for wasm_runtime_validate_app_addr. Currently skipped.
-
-        bh_memcpy_s(core_value_write_ptr, total_size_bytes, component_value_ptr, total_size_bytes);
-        return true;
     }
+    // Misplaced VAL_TYPE_KIND_FLAGS handling was removed from here.
 
     set_canon_error_v(error_buf, error_buf_size, "Unsupported type kind for lifting: %d", target_component_valtype->kind);
     return false;
@@ -1194,26 +1254,92 @@ wasm_component_canon_lower_value(
                     if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
 
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
-                    LOG_WARNING("String lowering for Latin1+UTF16: Currently treating as UTF-8. Full support pending.");
-                    // Fallback to UTF-8 like behavior
-                    wasm_len = strlen(str_to_lower); // byte length
-                    uint32 alloc_size_bytes = wasm_len;
-                    if (use_wasm_realloc) {
-                        uint32 argv[4] = {0, 0, 1, alloc_size_bytes};
-                        WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
-                        if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) { set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for Latin1+UTF16 (as UTF-8). Error: %s", wasm_runtime_get_exception(module_inst)); return false; }
-                        wasm_offset = argv[0];
-                        if (wasm_offset == 0 && alloc_size_bytes > 0) { set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for Latin1+UTF16 (as UTF-8)."); return false; }
-                        alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
+                    uint32 utf8_src_len_bytes = strlen(str_to_lower);
+                    uint32 latin1_char_count;
+                    bool is_latin1_compatible = can_encode_as_latin1(str_to_lower, utf8_src_len_bytes, &latin1_char_count);
+
+                    if (is_latin1_compatible) {
+                        wasm_len = latin1_char_count; // Length is number of Latin-1 characters (bytes)
+                        uint32 alloc_size_bytes = wasm_len;
+                        uint32 align = 1;
+
+                        if (use_wasm_realloc) {
+                            uint32 argv[4] = {0, 0, align, alloc_size_bytes};
+                            WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                            if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) {
+                                set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for Latin1 string. Error: %s", wasm_runtime_get_exception(module_inst)); return false;
+                            }
+                            wasm_offset = argv[0];
+                            if (wasm_offset == 0 && alloc_size_bytes > 0) { set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for Latin1 string."); return false; }
+                            alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
+                        } else {
+                            alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
+                        }
+
+                        if (!alloc_native_ptr && alloc_size_bytes > 0) {
+                            set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for Latin1 string in Wasm.", alloc_size_bytes); return false;
+                        }
+
+                        if (alloc_native_ptr) {
+                            // Transcode UTF-8 to Latin-1 bytes directly into Wasm memory
+                            uint32 utf8_idx = 0;
+                            uint32 latin1_write_idx = 0;
+                            while (utf8_idx < utf8_src_len_bytes && latin1_write_idx < wasm_len) {
+                                uint8 c1 = str_to_lower[utf8_idx];
+                                uint32 code_point;
+                                 uint32 consumed_utf8_bytes;
+                                if (c1 < 0x80) { code_point = c1; consumed_utf8_bytes = 1; }
+                                else if ((c1 & 0xE0) == 0xC0) {
+                                    uint8 c2 = str_to_lower[utf8_idx + 1];
+                                    code_point = ((c1 & 0x1F) << 6) | (c2 & 0x3F); consumed_utf8_bytes = 2;
+                                } else { // Should be caught by can_encode_as_latin1, but as safety:
+                                     set_canon_error(error_buf, error_buf_size, "Unexpected multi-byte UTF-8 char during Latin1 lowering.");
+                                     if (!use_wasm_realloc && wasm_offset != 0) wasm_runtime_module_free(module_inst, wasm_offset);
+                                     // If use_wasm_realloc, memory might be leaked here on error. Consider adding `realloc(offset, old_size, align, 0)` if possible.
+                                     return false;
+                                }
+                                ((uint8*)alloc_native_ptr)[latin1_write_idx++] = (uint8)code_point;
+                                utf8_idx += consumed_utf8_bytes;
+                            }
+                        }
+                        LOG_VERBOSE("Lowered string as Latin-1 (encoding %d) to wasm mem offset %u, length %u (bytes)", string_encoding, wasm_offset, wasm_len);
                     } else {
-                        alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
+                        // Not Latin-1 compatible, encode as UTF-16LE
+                        uint16 *temp_utf16_host_buffer = transcode_utf8_to_utf16le_on_host(str_to_lower, utf8_src_len_bytes,
+                                                                                         &wasm_len, /* out: utf16_code_units */
+                                                                                         error_buf, error_buf_size);
+                        if (!temp_utf16_host_buffer && utf8_src_len_bytes > 0) { return false; }
+
+                        uint32 alloc_size_bytes = wasm_len * sizeof(uint16);
+                        uint32 align = sizeof(uint16);
+
+                        if (use_wasm_realloc) {
+                            uint32 argv[4] = {0, 0, align, alloc_size_bytes};
+                            WASMFunctionInstance *realloc_f = wasm_runtime_get_function(module_inst, realloc_func_idx);
+                            if (!realloc_f || !wasm_runtime_call_wasm(exec_env, realloc_f, 4, argv)) {
+                                if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                                set_canon_error_v(error_buf, error_buf_size, "Wasm realloc failed for UTF-16 string (latin1+utf16 fallback). Error: %s", wasm_runtime_get_exception(module_inst)); return false;
+                            }
+                            wasm_offset = argv[0];
+                            if (wasm_offset == 0 && alloc_size_bytes > 0) {
+                                if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                                set_canon_error(error_buf, error_buf_size, "Wasm realloc returned 0 for UTF-16 string (latin1+utf16 fallback)."); return false;
+                            }
+                            alloc_native_ptr = wasm_runtime_addr_app_to_native(module_inst, mem_idx, wasm_offset);
+                        } else {
+                            alloc_native_ptr = wasm_runtime_module_malloc(module_inst, alloc_size_bytes, (void**)&wasm_offset);
+                        }
+
+                        if (!alloc_native_ptr && alloc_size_bytes > 0) {
+                            if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                            set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for UTF-16 string (latin1+utf16 fallback) in Wasm.", alloc_size_bytes); return false;
+                        }
+                        if (alloc_native_ptr && temp_utf16_host_buffer && alloc_size_bytes > 0) {
+                             bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, temp_utf16_host_buffer, alloc_size_bytes);
+                        }
+                        if(temp_utf16_host_buffer) loader_free(temp_utf16_host_buffer);
+                        LOG_VERBOSE("Lowered string as UTF-16LE (encoding %d fallback) to wasm mem offset %u, length %u (code units)", string_encoding, wasm_offset, wasm_len);
                     }
-                    if (!alloc_native_ptr && alloc_size_bytes > 0) { set_canon_error_v(error_buf, error_buf_size, "Failed to allocate %u bytes for Latin1+UTF16 (as UTF-8).", alloc_size_bytes); return false; }
-                    if (alloc_native_ptr) bh_memcpy_s(alloc_native_ptr, alloc_size_bytes, str_to_lower, wasm_len);
-                    // Note: wasm_len here is byte length. If the intent for Latin1+UTF16 is to pass UTF-16 code units, this is incorrect.
-                    // For now, it mirrors UTF-8, meaning 'length' is byte count.
-                    // set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
-                    // return false;
                 } else {
                     set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option for lowering: %d", string_encoding);
                     return false;
@@ -1808,13 +1934,13 @@ wasm_component_canon_lower_value(
         uint32 *element_core_alignments = NULL;
         bool abi_details_success = true;
 
-        if (tuple_type->field_count > 0) {
-            element_core_sizes = loader_malloc(tuple_type->field_count * sizeof(uint32), error_buf, error_buf_size);
+        if (tuple_type->element_count > 0) {
+            element_core_sizes = loader_malloc(tuple_type->element_count * sizeof(uint32), error_buf, error_buf_size);
             if (!element_core_sizes) { 
                 set_canon_error(error_buf, error_buf_size, "Failed to allocate memory for element sizes.");
                 return false; 
             }
-            element_core_alignments = loader_malloc(tuple_type->field_count * sizeof(uint32), error_buf, error_buf_size);
+            element_core_alignments = loader_malloc(tuple_type->element_count * sizeof(uint32), error_buf, error_buf_size);
             if (!element_core_alignments) { 
                 loader_free(element_core_sizes); 
                 set_canon_error(error_buf, error_buf_size, "Failed to allocate memory for element alignments.");
@@ -1822,8 +1948,8 @@ wasm_component_canon_lower_value(
             }
         }
 
-        for (uint32 i = 0; i < tuple_type->field_count; ++i) {
-            WASMComponentValType *element_val_type = tuple_type->fields[i].valtype;
+        for (uint32 i = 0; i < tuple_type->element_count; ++i) {
+            WASMComponentValType *element_val_type = &tuple_type->element_valtypes[i];
             if (!get_component_type_core_abi_details(element_val_type, module_inst,
                                                     &element_core_sizes[i], &element_core_alignments[i],
                                                     error_buf, error_buf_size)) {
@@ -1904,6 +2030,35 @@ wasm_component_canon_lower_value(
         
         LOG_VERBOSE("Lowered tuple to wasm mem offset %u, total_size %u", wasm_tuple_offset, total_wasm_alloc_size);
         return true;
+    } else if (source_component_valtype->kind == VAL_TYPE_KIND_FLAGS) {
+        // component_value_ptr points to the host-side uint32_t* array.
+        // core_value_write_ptr is where the i32(s) should be written in Wasm memory.
+        // target_core_wasm_type is not directly used here as flags map to a sequence of i32s.
+
+        uint32 label_count = source_component_valtype->u.flags.label_count;
+        if (label_count == 0) {
+            // No data to write for zero flags. core_value_write_ptr might not even be valid if size is 0.
+            return true;
+        }
+
+        uint32 num_i32s = (label_count + 31) / 32;
+        uint32 total_size_bytes = num_i32s * sizeof(uint32);
+
+        if (!component_value_ptr) {
+            set_canon_error(error_buf, error_buf_size, "Flags lowering received null component_value_ptr for non-empty flags.");
+            return false;
+        }
+        if (!core_value_write_ptr) {
+             set_canon_error(error_buf, error_buf_size, "Flags lowering received null core_value_write_ptr for non-empty flags.");
+            return false;
+        }
+
+        // LOG_TODO: Direct memory validation for flags lowering to core_value_write_ptr is complex
+        // as it requires knowing the Wasm app_offset that core_value_write_ptr corresponds to
+        // for wasm_runtime_validate_app_addr. Currently skipped.
+
+        bh_memcpy_s(core_value_write_ptr, total_size_bytes, component_value_ptr, total_size_bytes);
+        return true;
     }
 
     set_canon_error_v(error_buf, error_buf_size, "Unsupported type kind for lowering: %d", source_component_valtype->kind);
@@ -1958,14 +2113,14 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
             WASMComponentTupleType *tuple_type = &val_type->u.tuple;
             uint32 current_offset = 0;
             uint32 max_align = 1;
-            if (tuple_type->field_count == 0) { // Empty tuple
+            if (tuple_type->element_count == 0) { // Empty tuple
                 *out_size = 0;
                 *out_alignment = 1;
                 return true;
             }
-            for (uint32 i = 0; i < tuple_type->field_count; ++i) {
+            for (uint32 i = 0; i < tuple_type->element_count; ++i) {
                 uint32 field_size, field_alignment;
-                if (!get_component_type_core_abi_details(tuple_type->fields[i].valtype, module_inst, &field_size, &field_alignment, error_buf, error_buf_size)) {
+                if (!get_component_type_core_abi_details(&tuple_type->element_valtypes[i], module_inst, &field_size, &field_alignment, error_buf, error_buf_size)) {
                     return false; // Error already set
                 }
                 if (field_alignment == 0) {
@@ -2233,22 +2388,28 @@ wasm_component_canon_resource_new(
                     // if this resource.new is called from a core Wasm context.
                     // This is a simplification. A robust solution needs to determine which core module
                     // actually implements this resource type and its destructor.
-                    WASMModuleInstance *module_inst = wasm_runtime_get_module_inst(exec_env);
-                    if (module_inst) {
-                        // Validate dtor_core_func_idx against module_inst's function counts
+                    WASMModuleInstance *current_module_inst = wasm_runtime_get_module_inst(exec_env);
+                    // TODO: Robustly determine the *actual* defining core module instance for this resource type.
+                    // For now, using current_module_inst as a placeholder, which might be incorrect
+                    // if the resource type definition and its dtor are from a different core module
+                    // (e.g. imported component, or another core module within the same component).
+                    // The dtor_func_idx is relative to that defining module.
+                    if (current_module_inst) {
+                        LOG_WARNING("Resource.New: Using current module instance (%p) as placeholder for destructor owner of resource type idx %u. This may be incorrect if dtor is in a different module.",
+                                    (void*)current_module_inst, resource_type_def_idx);
+                        // Validate dtor_core_func_idx against current_module_inst's function counts
                         // This index is into the *defining* core module's function space.
-                        // If the resource is defined by this module_inst:
-                        if (res_type_info->dtor_func_idx < module_inst->function_count) {
-                             global_resource_table[new_handle].owner_module_inst = module_inst;
+                        if (res_type_info->dtor_func_idx < current_module_inst->function_count) {
+                             global_resource_table[new_handle].owner_module_inst = current_module_inst; // Placeholder
                              global_resource_table[new_handle].dtor_core_func_idx = res_type_info->dtor_func_idx;
-                             LOG_VERBOSE("Registered destructor for resource handle %d: mod_inst %p, func_idx %u",
-                                        new_handle, module_inst, res_type_info->dtor_func_idx);
+                             LOG_VERBOSE("Registered destructor for resource handle %d: mod_inst %p (placeholder), func_idx %u",
+                                        new_handle, (void*)current_module_inst, res_type_info->dtor_func_idx);
                         } else {
-                            LOG_WARNING("Resource type %u has dtor_func_idx %u out of bounds for current module %p. Destructor not registered.",
-                                        resource_type_def_idx, res_type_info->dtor_func_idx, module_inst);
+                            LOG_WARNING("Resource type %u has dtor_func_idx %u out of bounds for current (placeholder) module %p. Destructor not registered.",
+                                        resource_type_def_idx, res_type_info->dtor_func_idx, (void*)current_module_inst);
                         }
                     } else {
-                        LOG_WARNING("Cannot register destructor for resource type %u: module_inst not available in exec_env.", resource_type_def_idx);
+                        LOG_WARNING("Cannot register destructor for resource type %u: current module_inst from exec_env is NULL.", resource_type_def_idx);
                     }
                 }
             } else {
@@ -2336,33 +2497,50 @@ wasm_component_canon_resource_drop(
             WASMExecEnv *target_exec_env = NULL;
             // Determine the correct exec_env for the call.
             // If the current exec_env's module_inst is the owner_module, we can potentially reuse it.
-            // However, creating a temporary one or using a dedicated one for the owner_module is safer.
-            // For now, if current exec_env is not for the owner_module, this is complex.
-            if (wasm_runtime_get_module_inst(exec_env) == owner_module) {
+            WASMModuleInstance *current_module_from_exec_env = wasm_runtime_get_module_inst(exec_env);
+            bool created_temp_exec_env = false;
+
+            if (current_module_from_exec_env == owner_module) {
                 target_exec_env = exec_env;
-                 if (target_exec_env) { // Check if target_exec_env is valid before calling
-                    if (!wasm_runtime_call_wasm(target_exec_env, dtor_func, 1, argv)) {
-                        // Exception occurred during destructor call
-                        const char *exception = wasm_runtime_get_exception(owner_module);
-                        LOG_WARNING("Exception during destructor call for resource handle %d: %s", handle, exception);
-                        // Clear the exception on the owner_module.
-                        wasm_runtime_clear_exception(owner_module);
-                        // Even if destructor traps, the resource is considered dropped from host perspective.
-                    }
-                    // No need to destroy target_exec_env if it was exec_env
-                }
+                LOG_VERBOSE("Destructor for handle %d: Using current exec_env for owner_module %p.", handle, (void*)owner_module);
             } else {
-                // TODO: Cross-module destructor calls are complex.
-                // For now, log a warning and skip the destructor call.
-                // The resource will still be marked inactive.
-                LOG_WARNING("Cross-module destructor call for resource handle %d (owner %p, current %p) is not supported. Destructor will not be called.",
-                            handle, owner_module, wasm_runtime_get_module_inst(exec_env));
-                // Do not set target_exec_env, so the call is skipped.
+                LOG_VERBOSE("Destructor for handle %d: Current module %p is different from owner module %p. Attempting to create temporary exec_env.",
+                            handle, (void*)current_module_from_exec_env, (void*)owner_module);
+                // Note: wasm_exec_env_create_internal expects a WASMModuleInstance, not WASMModuleInstanceInternal.
+                // Assuming owner_module is WASMModuleInstance*.
+                target_exec_env = wasm_exec_env_create_internal(owner_module);
+                if (!target_exec_env) {
+                    LOG_WARNING("Failed to create temporary exec_env for owner_module %p to call destructor for handle %d. Destructor will be skipped.",
+                                (void*)owner_module, handle);
+                    // target_exec_env remains NULL, destructor call will be skipped.
+                } else {
+                    created_temp_exec_env = true;
+                    LOG_VERBOSE("Successfully created temporary exec_env %p for owner_module %p.", (void*)target_exec_env, (void*)owner_module);
+                }
             }
-            // The block for `if (target_exec_env)` and its contents are now handled within the if/else above.
+
+            if (target_exec_env) {
+                if (!wasm_runtime_call_wasm(target_exec_env, dtor_func, 1, argv)) {
+                    const char *exception = wasm_runtime_get_exception(owner_module);
+                    LOG_WARNING("Exception during destructor call for resource handle %d (owner %p, dtor_idx %u): %s",
+                                handle, (void*)owner_module, dtor_idx, exception);
+                    wasm_runtime_clear_exception(owner_module);
+                } else {
+                    LOG_VERBOSE("Successfully called destructor for resource handle %d (owner %p, dtor_idx %u).",
+                                handle, (void*)owner_module, dtor_idx);
+                }
+
+                if (created_temp_exec_env) {
+                    wasm_exec_env_destroy_internal(target_exec_env);
+                    LOG_VERBOSE("Destroyed temporary exec_env %p for owner_module %p.", (void*)target_exec_env, (void*)owner_module);
+                }
+            }
+            // If target_exec_env was NULL (e.g. temp creation failed), the call is skipped.
         } else {
-            LOG_WARNING("Destructor function with index %u not found in owner module for handle %d.", dtor_idx, handle);
+            LOG_WARNING("Destructor function with index %u not found in owner module %p for handle %d.", dtor_idx, (void*)owner_module, handle);
         }
+    } else {
+        LOG_VERBOSE("No destructor registered for resource handle %d (owner_module: %p, dtor_idx: %u).", handle, (void*)owner_module, dtor_idx);
     }
 
     // Mark as inactive and clear dtor info regardless of dtor success/failure
