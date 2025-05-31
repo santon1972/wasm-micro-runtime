@@ -9,6 +9,7 @@
 #include "wasm_component_loader.h" /* For WASMComponent */
 #include "wasm_runtime.h"          /* For WASMModuleInstance, WASMExecEnv */
 #include "../common/wasm_c_api_internal.h" /* For bool, uint32, etc. */
+#include "bh_thread.h" /* For korp_mutex */
 
 #ifdef __cplusplus
 extern "C" {
@@ -79,8 +80,19 @@ struct WASMComponentInstanceInternal {
     /* Internal bookkeeping */
     // Map from core_instance_def_idx to index in module_instances array.
     // Only valid for CORE_INSTANCE_KIND_INSTANTIATE. Others can be marked with a sentinel.
-    uint32 *core_instance_map; 
+    uint32 *core_instance_map;
+
+    /* Active resource tracking */
+    ActiveResourceHandle *active_resource_list_head;
+    korp_mutex active_resource_list_lock;
 };
+
+// Definition for ActiveResourceHandle
+typedef struct ActiveResourceHandle {
+    uint32 resource_type_idx; /* Index into component_def->type_definitions */
+    uint32 resource_handle_core_value; /* The actual i32 value representing the handle in core Wasm */
+    struct ActiveResourceHandle *next;
+} ActiveResourceHandle;
 
 /**
  * Instantiates a WebAssembly Component.

@@ -129,6 +129,14 @@ wasm_component_instance_instantiate(
     comp_inst_internal->resolved_imports = resolved_imports; // Shallow copy
     comp_inst_internal->num_resolved_imports = num_resolved_imports;
 
+    /* Initialize active resource tracking */
+    comp_inst_internal->active_resource_list_head = NULL;
+    if (os_mutex_init(&comp_inst_internal->active_resource_list_lock) != 0) {
+        set_comp_rt_error(error_buf, error_buf_size, "Failed to initialize active resource list lock.");
+        bh_free(comp_inst_internal);
+        return NULL;
+    }
+
     // Count how many core modules will be truly instantiated by this component
     // (i.e., kind CORE_INSTANCE_KIND_INSTANTIATE)
     uint32 num_modules_to_instantiate = 0;
@@ -1047,6 +1055,70 @@ wasm_component_instance_deinstantiate(WASMComponentInstanceInternal *comp_inst)
     if (comp_inst->core_instance_map) {
         bh_free(comp_inst->core_instance_map);
     }
+
+    // Clean up active resources
+    LOG_DEBUG("Cleaning up active resources for component instance %p", comp_inst);
+    os_mutex_lock(&comp_inst->active_resource_list_lock);
+    ActiveResourceHandle *current_handle = comp_inst->active_resource_list_head;
+    ActiveResourceHandle *next_handle;
+    while (current_handle) {
+        next_handle = current_handle->next;
+        LOG_VERBOSE("Deinstantiate: attempting to call destructor for active resource (type_idx: %u, handle_val: %u)",
+                    current_handle->resource_type_idx, current_handle->resource_handle_core_value);
+
+        // Ensure component_def and type_definitions are valid
+        if (comp_inst->component_def && comp_inst->component_def->type_definitions
+            && current_handle->resource_type_idx < comp_inst->component_def->type_definition_count) {
+            WASMComponentDefinedType *type_def = &comp_inst->component_def->type_definitions[current_handle->resource_type_idx];
+            if (type_def && type_def->kind == DEF_TYPE_KIND_RESOURCE) {
+                WASMComponentResourceType *res_type = &type_def->u.res_type;
+                if (res_type->dtor_func_idx != (uint32)-1) {
+                    LOG_TODO("Destructor call for resource type_idx %u, dtor_func_idx %u, handle %u needs full implementation (finding module and function, then calling wasm_runtime_call_wasm).",
+                             current_handle->resource_type_idx, res_type->dtor_func_idx, current_handle->resource_handle_core_value);
+                    /*
+                    // Conceptual full implementation:
+                    // 1. Resolve dtor_func_idx to a WASMModuleInstance* and func_idx_in_module.
+                    //    This is the most complex part. It might involve searching core_module_instances
+                    //    or having a pre-built map if destructors are always in a specific module or linked explicitly.
+                    //    Let's assume a hypothetical resolve_destructor_function:
+                    // WASMFunctionInstance *dtor_func_inst = resolve_destructor_function(comp_inst, res_type->dtor_func_idx);
+                    // WASMModuleInstance *dtor_module_inst = resolve_module_for_destructor_function(comp_inst, res_type->dtor_func_idx);
+
+                    // if (dtor_func_inst && dtor_module_inst) {
+                    //     uint32 argv[1] = { current_handle->resource_handle_core_value };
+                    //     WASMExecEnv *exec_env_for_dtor = dtor_module_inst->exec_env; // Or a temporary one
+                    //     if (!wasm_runtime_call_wasm(exec_env_for_dtor, dtor_func_inst, 1, argv)) {
+                    //         LOG_WARNING("Destructor call failed for resource (type_idx: %u, handle: %u): %s",
+                    //                     current_handle->resource_type_idx, current_handle->resource_handle_core_value,
+                    //                     wasm_runtime_get_exception(dtor_module_inst));
+                    //         wasm_runtime_clear_exception(dtor_module_inst);
+                    //     } else {
+                    //         LOG_VERBOSE("Successfully called destructor for resource (type_idx: %u, handle: %u)",
+                    //                     current_handle->resource_type_idx, current_handle->resource_handle_core_value);
+                    //     }
+                    // } else {
+                    //     LOG_WARNING("Could not resolve destructor function (dtor_func_idx %u) for resource type_idx %u.",
+                    //                 res_type->dtor_func_idx, current_handle->resource_type_idx);
+                    // }
+                    */
+                }
+            } else if (type_def && type_def->kind != DEF_TYPE_KIND_RESOURCE) {
+                 LOG_WARNING("Deinstantiate: active resource type_idx %u is not DEF_TYPE_KIND_RESOURCE (kind %u).",
+                            current_handle->resource_type_idx, type_def->kind);
+            } else if (!type_def) {
+                LOG_WARNING("Deinstantiate: type_def for active resource type_idx %u is NULL.", current_handle->resource_type_idx);
+            }
+        } else {
+            LOG_WARNING("Deinstantiate: component_def or type_definitions missing, or resource_type_idx %u out of bounds while cleaning up active resource.",
+                        current_handle->resource_type_idx);
+        }
+
+        bh_free(current_handle);
+        current_handle = next_handle;
+    }
+    comp_inst->active_resource_list_head = NULL;
+    os_mutex_unlock(&comp_inst->active_resource_list_lock);
+    os_mutex_destroy(&comp_inst->active_resource_list_lock);
 
     bh_free(comp_inst);
 }

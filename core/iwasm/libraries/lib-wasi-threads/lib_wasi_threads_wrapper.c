@@ -119,6 +119,15 @@ thread_spawn_wrapper(wasm_exec_env_t exec_env, uint32 start_arg)
     thread_start_arg->arg = start_arg;
     thread_start_arg->start_func = start_func;
 
+    // Note: thread_id is allocated at this point, and thread_id_lock is NOT held.
+    // It's crucial that wasm_cluster_create_thread and its callees:
+    // 1. Do not attempt to call allocate_thread_id() or deallocate_thread_id()
+    //    in a way that would re-acquire thread_id_lock before this function
+    //    either completes successfully or handles an error (which might involve
+    //    calling deallocate_thread_id itself).
+    // 2. Handle new_module_inst carefully, ensuring that if the new thread
+    //    accesses it, it's fully formed and an appropriate execution environment
+    //    is ready for it.
     ret = wasm_cluster_create_thread(exec_env, new_module_inst, false, 0, 0,
                                      thread_start, thread_start_arg);
     if (ret != 0) {
@@ -158,11 +167,18 @@ get_lib_wasi_threads_export_apis(NativeSymbol **p_lib_wasi_threads_apis)
 bool
 lib_wasi_threads_init(void)
 {
-    if (0 != os_mutex_init(&thread_id_lock))
+    // Best practice: ensure lock is in a known state before init,
+    // though os_mutex_init should handle this.
+    // memset(&thread_id_lock, 0, sizeof(korp_mutex)); // Uncomment if os_mutex_init expects zeroed memory.
+
+    if (0 != os_mutex_init(&thread_id_lock)) {
+        LOG_ERROR("Failed to initialize thread_id_lock"); // Added log for clarity
         return false;
+    }
 
     if (!tid_allocator_init(&tid_allocator)) {
-        os_mutex_destroy(&thread_id_lock);
+        LOG_ERROR("Failed to initialize tid_allocator"); // Added log for clarity
+        os_mutex_destroy(&thread_id_lock); // Clean up partially initialized state
         return false;
     }
 
@@ -172,6 +188,12 @@ lib_wasi_threads_init(void)
 void
 lib_wasi_threads_destroy(void)
 {
+    // Deinitialize the TID allocator first.
     tid_allocator_deinit(&tid_allocator);
+
+    // Destroy the mutex.
+    // It's assumed that by the time this function is called,
+    // no threads are actively trying to use this lock.
+    // Proper application shutdown should ensure this.
     os_mutex_destroy(&thread_id_lock);
 }
