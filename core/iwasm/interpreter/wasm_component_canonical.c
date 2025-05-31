@@ -227,14 +227,13 @@ wasm_component_canon_lift_value(
                         return false;
                     }
                     // TODO: Implement/call transcode_utf16_to_utf8(core_mem_base + offset, length (code units), &lifted_str_ptr, &lifted_str_len_bytes);
-                    // For now, placeholder:
-                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lifting not yet implemented.");
                     LOG_TODO("Implement UTF-16 to UTF-8 transcoding for string lifting.");
+                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lifting not yet implemented.");
                     return false; 
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
                     // TODO: Implement inspection and transcoding for Latin1+UTF16
-                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
                     LOG_TODO("Implement Latin1+UTF16 to UTF-8 transcoding for string lifting.");
+                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lifting not yet implemented.");
                     return false;
                 } else {
                      set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option: %d", string_encoding);
@@ -735,20 +734,18 @@ wasm_component_canon_lift_value(
         uint32 num_i32s = (label_count + 31) / 32;
         uint32 total_size_bytes = num_i32s * sizeof(uint32);
 
-        // Validate memory access if module_inst and mem_idx are available
-        // This check is simplified; a robust check would use mem_idx and validate the full range.
-        if (module_inst && mem_idx != (uint32)-1) {
-            if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, (uint32)(uintptr_t)core_value_ptr, total_size_bytes)) {
-                 // This validation is tricky if core_value_ptr is already a native pointer after some offset calculation.
-                 // Assuming core_value_ptr here is the direct Wasm memory address (offset) if it's from Wasm.
-                 // For now, this validation might be too simplistic if core_value_ptr isn't a direct wasm offset.
-                 // Let's assume core_value_ptr is a native pointer to the data in wasm linear memory.
-                 // The call to wasm_runtime_validate_app_addr expects an app offset, not a native ptr.
-                 // This part needs careful handling of how core_value_ptr is derived by the caller.
-                 // For now, we'll proceed assuming core_value_ptr is valid to read 'total_size_bytes' from.
-                 // LOG_WARNING("Skipping memory validation for flags lifting due to core_value_ptr nature.");
-            }
-        }
+        // LOG_TODO: Direct memory validation for flags lifting from core_value_ptr is complex
+        // as core_value_ptr might be a native pointer to Wasm memory or an offset,
+        // and its exact nature/origin needs careful handling for wasm_runtime_validate_app_addr.
+        // Currently skipped, proceeding with the assumption that core_value_ptr is valid.
+        // Example of commented out validation:
+        // if (module_inst && mem_idx != (uint32)-1) {
+        //     // This requires core_value_ptr to be an app_offset, not a native_ptr.
+        //     if (!wasm_runtime_validate_app_addr(module_inst, mem_idx, (uint32)(uintptr_t)core_value_ptr, total_size_bytes)) {
+        //          set_canon_error_v(error_buf, error_buf_size, "Invalid memory access for flags lifting at offset %p, size %u", core_value_ptr, total_size_bytes);
+        //          return false;
+        //     }
+        // }
 
 
         uint32_t *host_flags_array = loader_malloc(total_size_bytes, error_buf, error_buf_size);
@@ -788,8 +785,9 @@ wasm_component_canon_lift_value(
             return false;
         }
         
-        // TODO: Add validation for core_value_write_ptr if module_inst and mem_idx are available, similar to lifting.
-        // This requires knowing the app_offset that core_value_write_ptr corresponds to.
+        // LOG_TODO: Direct memory validation for flags lowering to core_value_write_ptr is complex
+        // as it requires knowing the Wasm app_offset that core_value_write_ptr corresponds to
+        // for wasm_runtime_validate_app_addr. Currently skipped.
 
         bh_memcpy_s(core_value_write_ptr, total_size_bytes, component_value_ptr, total_size_bytes);
         return true;
@@ -951,13 +949,13 @@ wasm_component_canon_lower_value(
                     // Allocate using realloc/malloc as above.
                     // Copy utf16_ptr to alloc_native_ptr.
                     // Free utf16_ptr if it was allocated by transcoder.
-                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lowering not yet implemented.");
                     LOG_TODO("Implement UTF-8 to UTF-16 transcoding for string lowering.");
+                    set_canon_error(error_buf, error_buf_size, "UTF-16 string lowering not yet implemented.");
                     return false;
                 } else if (string_encoding == CANONICAL_OPTION_STRING_ENCODING_LATIN1_UTF16) {
                     // TODO: Implement UTF-8 to Latin1/UTF16 transcoding.
-                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
                     LOG_TODO("Implement UTF-8 to Latin1/UTF16 transcoding for string lowering.");
+                    set_canon_error(error_buf, error_buf_size, "Latin1+UTF16 string lowering not yet implemented.");
                     return false;
                 } else {
                     set_canon_error_v(error_buf, error_buf_size, "Unknown string encoding option for lowering: %d", string_encoding);
@@ -1013,23 +1011,16 @@ wasm_component_canon_lower_value(
 
         if (host_list->count > 0) {
             if (use_wasm_realloc) {
-                uint32 list_alignment = core_element_size; // Simplification: using element size as alignment.
-                                                           // Should use get_component_type_core_abi_details for element_valtype's alignment.
-                                                           // For primitive lists, this is often correct.
-                // TODO: Get proper alignment for list elements using get_component_type_core_abi_details(element_valtype, ...)
-                // For now, using core_element_size which is a decent proxy for primitives.
-                // If element_valtype is complex, its alignment might differ from its flat size.
-                // Let's assume element_valtype is primitive as per current list limitations.
-                // uint32 list_element_true_align = 1;
-                // if(!get_component_type_core_abi_details(element_valtype, module_inst, &core_element_size, &list_element_true_align, error_buf, error_buf_size)){
-                //    return false; // Error set by helper
-                // }
-                // Using core_element_size as alignment for now.
+                // LOG_TODO: For complex list elements (if supported in future),
+                // list_alignment for realloc should be determined by get_component_type_core_abi_details
+                // for the element's true alignment. Current use of core_element_size is
+                // acceptable for primitive elements.
+                uint32 list_alignment = core_element_size;
 
                 uint32 argv[4];
                 argv[0] = 0; // old_ptr
                 argv[1] = 0; // old_size
-                argv[2] = list_alignment; 
+                argv[2] = list_alignment;
                 argv[3] = total_wasm_alloc_size; // new_size
                 
                 WASMFunctionInstance *realloc_func = NULL;
@@ -1758,11 +1749,19 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
                 if (!get_component_type_core_abi_details(tuple_type->fields[i].valtype, module_inst, &field_size, &field_alignment, error_buf, error_buf_size)) {
                     return false; // Error already set
                 }
+                if (field_alignment == 0) {
+                    set_canon_error(error_buf, error_buf_size, "Tuple field alignment is zero.");
+                    return false;
+                }
                 current_offset = align_up(current_offset, field_alignment);
                 current_offset += field_size;
                 if (field_alignment > max_align) {
                     max_align = field_alignment;
                 }
+            }
+            if (max_align == 0) {
+                set_canon_error(error_buf, error_buf_size, "Tuple max alignment is zero.");
+                return false;
             }
             *out_size = align_up(current_offset, max_align);
             *out_alignment = max_align;
@@ -1783,11 +1782,19 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
                 if (!get_component_type_core_abi_details(record_type->fields[i].valtype, module_inst, &field_size, &field_alignment, error_buf, error_buf_size)) {
                     return false; // Error already set
                 }
+                if (field_alignment == 0) {
+                    set_canon_error(error_buf, error_buf_size, "Record field alignment is zero.");
+                    return false;
+                }
                 current_offset = align_up(current_offset, field_alignment);
                 current_offset += field_size;
                 if (field_alignment > max_align) {
                     max_align = field_alignment;
                 }
+            }
+            if (max_align == 0) {
+                set_canon_error(error_buf, error_buf_size, "Record max alignment is zero.");
+                return false;
             }
             *out_size = align_up(current_offset, max_align);
             *out_alignment = max_align;
@@ -1814,9 +1821,17 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
             // Option layout: discriminant, then potentially payload
             // Payload is only present for 'some', but space might be reserved or optimized.
             // Canonical ABI: discriminant followed by value, value is aligned.
+            if (val_align == 0) { // val_align comes from the payload type. If it's 0, it's an issue.
+                set_canon_error(error_buf, error_buf_size, "Option payload alignment (val_align) is zero.");
+                return false;
+            }
             uint32 payload_offset = align_up(disc_size, val_align);
             *out_size = payload_offset + val_size;
             *out_alignment = disc_align > val_align ? disc_align : val_align; // Max of discriminant and value alignment
+            if (*out_alignment == 0) {
+                set_canon_error(error_buf, error_buf_size, "Option calculated alignment is zero.");
+                return false;
+            }
             // The overall size must be aligned to its own alignment requirement
             *out_size = align_up(*out_size, *out_alignment);
             return true;
@@ -1847,9 +1862,17 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
             max_payload_align = ok_align > err_align ? ok_align : err_align;
             
             // Result layout: discriminant, then payload area (for ok or err)
+            if (max_payload_align == 0) {
+                 set_canon_error(error_buf, error_buf_size, "Result max_payload_align is zero.");
+                 return false;
+            }
             uint32 payload_offset = align_up(disc_size, max_payload_align);
             *out_size = payload_offset + max_payload_size;
             *out_alignment = disc_align > max_payload_align ? disc_align : max_payload_align;
+            if (*out_alignment == 0) {
+                set_canon_error(error_buf, error_buf_size, "Result calculated alignment is zero.");
+                return false;
+            }
             *out_size = align_up(*out_size, *out_alignment);
             return true;
         }
@@ -1885,9 +1908,17 @@ get_component_type_core_abi_details(const WASMComponentValType *val_type,
             }
             
             // Variant layout: discriminant, then payload area (for the largest case)
+            if (max_case_payload_align == 0) {
+                set_canon_error(error_buf, error_buf_size, "Variant max_case_payload_align is zero.");
+                return false;
+            }
             uint32 payload_offset = align_up(disc_size, max_case_payload_align);
             *out_size = payload_offset + max_case_payload_size;
             *out_alignment = disc_align > max_case_payload_align ? disc_align : max_case_payload_align;
+            if (*out_alignment == 0) {
+                set_canon_error(error_buf, error_buf_size, "Variant calculated alignment is zero.");
+                return false;
+            }
             *out_size = align_up(*out_size, *out_alignment);
             return true;
         }
@@ -2064,38 +2095,26 @@ wasm_component_canon_resource_drop(
             // For now, if current exec_env is not for the owner_module, this is complex.
             if (wasm_runtime_get_module_inst(exec_env) == owner_module) {
                 target_exec_env = exec_env;
+                 if (target_exec_env) { // Check if target_exec_env is valid before calling
+                    if (!wasm_runtime_call_wasm(target_exec_env, dtor_func, 1, argv)) {
+                        // Exception occurred during destructor call
+                        const char *exception = wasm_runtime_get_exception(owner_module);
+                        LOG_WARNING("Exception during destructor call for resource handle %d: %s", handle, exception);
+                        // Clear the exception on the owner_module.
+                        wasm_runtime_clear_exception(owner_module);
+                        // Even if destructor traps, the resource is considered dropped from host perspective.
+                    }
+                    // No need to destroy target_exec_env if it was exec_env
+                }
             } else {
-                // TODO: Handle cross-module destructor calls properly. This might involve
-                // creating a temporary exec_env for owner_module or ensuring one is available.
-                // This is a complex area, especially regarding thread safety and state.
-                LOG_WARNING("Cross-module destructor call for handle %d not fully supported yet. Attempting with current exec_env.", handle);
-                // Forcing use of current exec_env might be incorrect if it's from a different module/thread context.
-                // A proper solution might involve an exec_env pool or creating one on the fly for the owner_module.
-                // For this subtask, we'll log and proceed with caution or error out.
-                // Let's try to create a temporary one if they don't match.
-                target_exec_env = wasm_exec_env_create(owner_module); // Simplified: might need cluster from owner_module
-                if (!target_exec_env) {
-                    set_canon_error_v(error_buf, error_buf_size, "Failed to create exec_env for destructor call of handle %d.", handle);
-                    // Resource will still be marked inactive below, but dtor call failed.
-                    // This error should ideally propagate, but resource_drop is often best-effort for dtor.
-                }
+                // TODO: Cross-module destructor calls are complex.
+                // For now, log a warning and skip the destructor call.
+                // The resource will still be marked inactive.
+                LOG_WARNING("Cross-module destructor call for resource handle %d (owner %p, current %p) is not supported. Destructor will not be called.",
+                            handle, owner_module, wasm_runtime_get_module_inst(exec_env));
+                // Do not set target_exec_env, so the call is skipped.
             }
-            
-            if (target_exec_env) {
-                if (!wasm_runtime_call_wasm(target_exec_env, dtor_func, 1, argv)) {
-                    // Exception occurred during destructor call
-                    const char *exception = wasm_runtime_get_exception(owner_module);
-                    LOG_WARNING("Exception during destructor call for resource handle %d: %s", handle, exception);
-                    // Clear the exception on the owner_module.
-                    wasm_runtime_clear_exception(owner_module);
-                    // Even if destructor traps, the resource is considered dropped from host perspective.
-                }
-
-                if (target_exec_env != exec_env) { // If we created a temporary one
-                    wasm_exec_env_destroy(target_exec_env);
-                }
-            }
-
+            // The block for `if (target_exec_env)` and its contents are now handled within the if/else above.
         } else {
             LOG_WARNING("Destructor function with index %u not found in owner module for handle %d.", dtor_idx, handle);
         }
@@ -2103,7 +2122,7 @@ wasm_component_canon_resource_drop(
 
     // Mark as inactive and clear dtor info regardless of dtor success/failure
     global_resource_table[handle].is_active = false;
-    global_resource_table[handle].host_data = NULL; 
+    global_resource_table[handle].host_data = NULL;
     global_resource_table[handle].component_resource_type_idx = 0;
     global_resource_table[handle].owner_module_inst = NULL;
     global_resource_table[handle].dtor_core_func_idx = (uint32)-1;

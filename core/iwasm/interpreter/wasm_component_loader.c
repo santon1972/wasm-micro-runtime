@@ -358,6 +358,15 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
                         goto fail;
                     }
 
+                    /*
+                     * Validate the parsed sort byte against the expected kind from the module import.
+                     * arg->kind is populated from the `parsed_sort_byte` read from the component binary.
+                     * This byte directly corresponds to WASMImportKind values (0x00:func, 0x01:table, etc.)
+                     * as defined in the component model specification for core instance arguments.
+                     * expected_kind is derived from WASMImport->kind from the target core module,
+                     * which is also a WASMImportKind.
+                     * Therefore, a direct comparison is correct here.
+                     */
                     if (arg->kind != expected_kind) {
                         set_error_buf_v(error_buf, error_buf_size,
                                         "parsed sort byte 0x%02X for arg '%s' does not match expected import kind 0x%02X",
@@ -1765,9 +1774,10 @@ parse_defined_type_entry(const uint8 **p_buf, const uint8 *buf_end,
                 goto fail;
             }
             break;
-        case 0x3f: /* resourcetype (Spec tag for resource type definition with abstract rep) */
-                   /* Note: Spec also has 0x3e for async dtor, not yet handled here. */
-            p++; /* Consume 0x3f */
+        /* Changed from 0x3f to 0x43 based on Component Model Binary Format 1.0 Spec (binary.md)
+           type-def ::= ... | 0x43 rt:resourcetype */
+        case 0x43: /* resourcetype */
+            p++; /* Consume 0x43 */
             defined_type->kind = DEF_TYPE_KIND_RESOURCE;
             if (!parse_resource_type(&p, buf_end, &defined_type->u.res_type, error_buf, error_buf_size)) {
                 goto fail;
@@ -2501,29 +2511,27 @@ wasm_component_unload(WASMComponent *component)
 
     if (component->values) {
         for (uint32 i = 0; i < component->value_count; ++i) {
+            WASMComponentValue *val_entry = &component->values[i];
             // Free the parsed_type contents first
-            free_valtype_contents(&component->values[i].parsed_type);
+            free_valtype_contents(&val_entry->parsed_type);
             // Then free specific value types like strings
-            if (component->values[i].parsed_type.kind == VAL_TYPE_KIND_PRIMITIVE &&
-                (component->values[i].parsed_type.u.primitive == PRIM_VAL_STRING ||
-                 component->values[i].parsed_type.u.primitive == PRIM_VAL_CHAR)) {
-                if (component->values[i].val.string_val) {
-                    wasm_runtime_free(component->values[i].val.string_val);
+            // Note: For PRIM_VAL_CHAR, if stored as u32, no string_val to free.
+            // This logic assumes string_val is used for string type only.
+            if (val_entry->parsed_type.kind == VAL_TYPE_KIND_PRIMITIVE &&
+                val_entry->parsed_type.u.primitive == PRIM_VAL_STRING) {
+                if (val_entry->val.string_val) {
+                    wasm_runtime_free(val_entry->val.string_val);
                 }
             }
-            // TODO: Add freeing for composite types stored in component->values[i].val if any are directly allocated.
+            // Composite types stored in component->values[i].val are not yet parsed/allocated,
+            // so no specific freeing needed for them here beyond what free_valtype_contents handles
+            // for their type descriptors.
         }
         wasm_runtime_free(component->values);
     }
 
     wasm_runtime_free(component);
 }
-
-// Forward declaration for load_value_section
-static bool
-load_value_section(const uint8 **p_buf, const uint8 *buf_end,
-                   WASMComponent *component,
-                   char *error_buf, uint32 error_buf_size);
 
 
 static bool
@@ -2532,7 +2540,7 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
                    char *error_buf, uint32 error_buf_size)
 {
     const uint8 *p = *p_buf;
-    uint32 value_entry_count, i;
+    uint32 value_entry_count, i = 0; // Initialize i for cleanup loop
 
     read_leb_uint32(p, buf_end, value_entry_count);
     LOG_VERBOSE("Component Value section with %u value entries.", value_entry_count);
@@ -2550,6 +2558,7 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
     component->values = loader_malloc(
         value_entry_count * sizeof(WASMComponentValue), error_buf, error_buf_size);
     if (!component->values) {
+        // error_buf already set by loader_malloc
         goto fail;
     }
     component->value_count = value_entry_count;
@@ -2561,7 +2570,8 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
         // Each value entry starts with a valtype
         if (!parse_valtype(&p, buf_end, &current_value_entry->parsed_type, error_buf, error_buf_size)) {
             LOG_ERROR("Failed to parse valtype for value entry %u.", i);
-            goto fail; // parse_valtype should set error_buf
+            // parse_valtype should set error_buf
+            goto fail_loop;
         }
 
         // Now parse the literal based on the parsed_type.kind and parsed_type.u.primitive
@@ -2586,14 +2596,11 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
                         case PRIM_VAL_S8: case PRIM_VAL_U8: max_bits = 8; break;
                         case PRIM_VAL_S16: case PRIM_VAL_U16: max_bits = 16; break;
                         case PRIM_VAL_S32: case PRIM_VAL_U32: max_bits = 32; break;
-                        default: break; // Should not happen
+                        default: /* Should not happen if cases are exhaustive */ break;
                     }
                     if (!read_leb((uint8 **)&p, buf_end, max_bits, is_signed, &temp_val, error_buf, error_buf_size)) {
-                        goto fail;
+                        goto fail_loop;
                     }
-                    // Store appropriately (sign extend if needed, though read_leb handles signed interpretation)
-                    // For simplicity, storing in u32/s32, assuming values fit.
-                    // Proper truncation/sign extension might be needed if storing in smaller types.
                     if (is_signed) current_value_entry->val.s32 = (int32)temp_val;
                     else current_value_entry->val.u32 = (uint32)temp_val;
                     break;
@@ -2601,9 +2608,9 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
                 case PRIM_VAL_S64:
                 case PRIM_VAL_U64: {
                     uint64 temp_val;
-                     bool is_signed = (current_value_entry->parsed_type.u.primitive == PRIM_VAL_S64);
+                    bool is_signed = (current_value_entry->parsed_type.u.primitive == PRIM_VAL_S64);
                     if (!read_leb((uint8 **)&p, buf_end, 64, is_signed, &temp_val, error_buf, error_buf_size)) {
-                        goto fail;
+                        goto fail_loop;
                     }
                     if (is_signed) current_value_entry->val.s64 = (int64)temp_val;
                     else current_value_entry->val.u64 = temp_val;
@@ -2619,26 +2626,28 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
                     bh_memcpy_s(&current_value_entry->val.f64, sizeof(float64), p, sizeof(float64));
                     p += sizeof(float64);
                     break;
-                case PRIM_VAL_CHAR: // Stored as string of length 1
+                case PRIM_VAL_CHAR: { // Spec: char is u32
+                    uint64 temp_char_val;
+                    if (!read_leb((uint8 **)&p, buf_end, 32, false, &temp_char_val, error_buf, error_buf_size)) {
+                         goto fail_loop;
+                    }
+                    current_value_entry->val.u32 = (uint32)temp_char_val; // Store as u32
+                    break;
+                }
                 case PRIM_VAL_STRING:
                     if (!parse_string(&p, buf_end, &current_value_entry->val.string_val, error_buf, error_buf_size)) {
-                        goto fail;
+                        goto fail_loop;
                     }
                     break;
                 default:
-                    set_error_buf_v(error_buf, error_buf_size, "unsupported primitive type 0x%02X for value literal", current_value_entry->parsed_type.u.primitive);
-                    goto fail;
+                    set_error_buf_v(error_buf, error_buf_size, "unsupported primitive type 0x%02X for value literal in value section", current_value_entry->parsed_type.u.primitive);
+                    goto fail_loop;
             }
         } else {
             // Composite types (list, record, variant, etc.)
-            // Spec: `value ::= <valtype> <literal | constructor>`
-            // Constructors like `(list (val*))` or `(record (fieldval*))`
-            // This implies recursive parsing of values for composite types.
-            LOG_TODO("Parsing for composite value type %d (kind %d) in Value Section not yet implemented.", i, current_value_entry->parsed_type.kind);
-            // To gracefully skip, we'd need to know the structure of these constructors.
-            // For now, fail if a non-primitive type's literal is encountered.
-            set_error_buf_v(error_buf, error_buf_size, "parsing for composite value type kind %d not implemented", current_value_entry->parsed_type.kind);
-            goto fail; 
+            LOG_TODO("Parsing for composite value type kind %d (entry %u) in Value Section not yet implemented.", current_value_entry->parsed_type.kind, i);
+            set_error_buf_v(error_buf, error_buf_size, "parsing for composite value type kind %d not implemented in Value Section", current_value_entry->parsed_type.kind);
+            goto fail_loop;
         }
         LOG_VERBOSE("Parsed value entry %u, type kind %d", i, current_value_entry->parsed_type.kind);
     }
@@ -2646,24 +2655,26 @@ load_value_section(const uint8 **p_buf, const uint8 *buf_end,
     *p_buf = p;
     return true;
 
-fail:
-    // Cleanup for component->values will be handled by wasm_component_unload if this function returns false
-    // and leads to overall loading failure. If this is a partial failure within the loop,
-    // already parsed values (including their parsed_type and any allocated strings) need to be freed.
-    if (component->values) {
-        for (uint32 j = 0; j <= i && j < component->value_count; ++j) { // Free up to the point of failure (inclusive of i if it was partially set)
-            free_valtype_contents(&component->values[j].parsed_type);
-             if (component->values[j].parsed_type.kind == VAL_TYPE_KIND_PRIMITIVE &&
-                (component->values[j].parsed_type.u.primitive == PRIM_VAL_STRING ||
-                 component->values[j].parsed_type.u.primitive == PRIM_VAL_CHAR)) {
-                if (component->values[j].val.string_val) {
-                    wasm_runtime_free(component->values[j].val.string_val);
-                }
-            }
+fail_loop: // Label for failures within the loop, requiring cleanup of already parsed entries
+    // Free already parsed values up to index i (inclusive, as i might be partially parsed)
+    for (uint32 j = 0; j <= i && j < component->value_count; ++j) {
+        WASMComponentValue *val_entry = &component->values[j];
+        free_valtype_contents(&val_entry->parsed_type); // Safe even if not fully parsed due to memset
+        if (val_entry->parsed_type.kind == VAL_TYPE_KIND_PRIMITIVE &&
+            val_entry->parsed_type.u.primitive == PRIM_VAL_STRING &&
+            val_entry->val.string_val) {
+            wasm_runtime_free(val_entry->val.string_val);
+            val_entry->val.string_val = NULL;
         }
+    }
+    // Fallthrough to main fail to free component->values array itself
+fail:
+    if (component->values) {
         wasm_runtime_free(component->values);
         component->values = NULL;
-        component->value_count = 0;
     }
+    component->value_count = 0;
+    // Update p_buf to reflect how far parsing actually went, helps with debugging section offset issues.
+    *p_buf = p;
     return false;
 }
