@@ -441,6 +441,308 @@ load_core_instance_section(const uint8 **p_buf, const uint8 *buf_end,
     *p_buf = p;
     return true;
 fail:
+    /* component->core_instances itself will be freed by wasm_component_unload if component is not NULL */
+    /* However, if we failed mid-way parsing a specific core_instance, its internal allocations need cleanup here */
+    /* 'i' holds the index of the core_instance being processed when failure occurred */
+    if (component && component->core_instances) {
+        /* Iterate up to the current instance 'i' or core_instance_count if 'i' is somehow past it (defensive) */
+        uint32 instance_idx_to_clean = i;
+        if (instance_idx_to_clean < component->core_instance_count) {
+            WASMComponentCoreInstance *current_instance_on_fail = &component->core_instances[instance_idx_to_clean];
+
+            if (current_instance_on_fail->kind == CORE_INSTANCE_KIND_INSTANTIATE) {
+                if (current_instance_on_fail->u.instantiate.args) {
+                    /* 'j' is not in scope here. We need to iterate all args of the failing instance */
+                    /* The parse_string for arg->name happens inside the loop for args.
+                       If parse_string fails, it frees arg->name.
+                       If parse_string succeeds but a later step fails, arg->name needs freeing.
+                       The main loop for 'j' in load_core_instance_section might not have completed.
+                       We need to check each arg->name up to the point of failure if possible,
+                       or more safely, iterate all allocated args and free their names if non-NULL.
+                       However, the 'j' loop in the main function body is responsible for parsing args.
+                       If that loop fails, for example at arg k, then args 0 to k-1 are fully parsed,
+                       and arg k might be partially parsed.
+                       The wasm_component_unload function handles freeing these if the whole component load fails.
+                       This local 'fail' label is for when load_core_instance_section itself fails.
+                       If loader_malloc for current_instance->u.instantiate.args fails, it's NULL.
+                       If a parse_string for arg->name fails, parse_string frees arg->name.
+                       If a CHECK_BUF or read_leb_uint32 fails after some args are parsed, their names need freeing.
+                       The most robust approach here is to clean what was being *actively constructed* by this function
+                       if it's not yet fully part of the component structure that wasm_component_unload would handle
+                       or if wasm_component_unload's logic for this specific field isn't granular enough.
+
+                       Given wasm_component_unload frees component->core_instances[i].u.instantiate.args[j].name,
+                       and frees component->core_instances[i].u.instantiate.args,
+                       the primary concern here is if component->core_instances itself is non-NULL,
+                       but this specific instance `i` was being populated and an error occurred
+                       *before* it was considered fully formed for wasm_component_unload.
+
+                       The current wasm_component_unload iterates through `component->core_instance_count`.
+                       If `load_core_instance_section` fails *after* `component->core_instances`
+                       is allocated and `component->core_instance_count` is set, but *during*
+                       the loop that populates an individual instance (e.g., `component->core_instances[i]`),
+                       then `wasm_component_unload` will try to free `component->core_instances[i]`.
+
+                       Let's consider what `wasm_component_unload` does for core_instances:
+                       It iterates `core_instance_count`. For each `inst`:
+                         If `inst->kind == CORE_INSTANCE_KIND_INSTANTIATE`:
+                           If `inst->u.instantiate.args`:
+                             Iterates `inst->u.instantiate.arg_count`. Frees `args[j].name`.
+                             Frees `inst->u.instantiate.args`.
+                         If `inst->kind == CORE_INSTANCE_KIND_INLINE_EXPORT`:
+                           (similar logic for exports)
+                       Then it frees `component->core_instances`.
+
+                       This seems comprehensive. If `load_core_instance_section` fails,
+                       `wasm_component_load`'s `fail` path calls `wasm_component_unload(component)`.
+                       If `component->core_instances` was allocated and `core_instance_count` set,
+                       `wasm_component_unload` will iterate through them.
+                       If `core_instances[i].u.instantiate.args` was allocated and `arg_count` set,
+                       it will iterate those. If `args[j].name` was set, it will free it.
+
+                       The only scenario for a leak here that `wasm_component_unload` might miss is:
+                       1. `component->core_instances` is allocated.
+                       2. `component->core_instance_count` is set.
+                       3. Loop for instance `i` starts.
+                       4. `current_instance->u.instantiate.args` is allocated.
+                       5. `current_instance->u.instantiate.arg_count` is set.
+                       6. Loop for arg `j` starts.
+                       7. `parse_string` for `arg->name` succeeds.
+                       8. A subsequent `CHECK_BUF` or `read_leb_uint32` for `arg->instance_idx` or `arg->kind` fails.
+                          This `goto fail` is triggered.
+                       In this case, `arg->name` is allocated but `wasm_component_unload` will clean it up
+                       because `arg_count` is set and `args` is allocated.
+
+                       Consider if `loader_malloc` for `current_instance->u.instantiate.args` succeeds,
+                       but then `memset` or a subsequent operation before setting `arg_count` (if that were the order)
+                       or before the loop for `j` fails.
+                       `current_instance->u.instantiate.args` would be allocated but `arg_count` might be 0.
+                       `wasm_component_unload` would free `args` but not loop to free names.
+                       However, `arg_count` is read *before* allocating `args`. So this is not an issue.
+
+                       Consider if `parse_string` for `arg->name` fails. `parse_string` itself frees `*out_str`. No leak.
+
+                       It seems `wasm_component_unload` is robust enough for `core_instances`.
+                       The original request was to add cleanup in the local `fail` label.
+                       This might be redundant if `wasm_component_unload` handles it, but explicit local cleanup
+                       can be safer if `wasm_component_unload`'s conditions aren't perfectly met (e.g. if `core_instance_count`
+                       was not yet updated to include `i` when the failure on instance `i` happened).
+
+                       Let's assume `i` is the index of the instance that was being processed.
+                       If `component->core_instances[i].u.instantiate.args` was allocated, but then an error
+                       occurred while processing its arguments (e.g., parsing `arg->name` for `args[j]` succeeded,
+                       but then `arg->kind` parsing failed), then `args[j].name` needs to be freed,
+                       and then `args` itself. `wasm_component_unload` handles this.
+
+                       The only case for local cleanup is if `component->core_instances` itself is allocated,
+                       `component->core_instance_count` is set, but the loop for `i` fails in such a way
+                       that `wasm_component_unload` might not correctly clean instance `i` because some
+                       sub-fields (like `arg_count`) might not be set yet.
+
+                       Let's analyze the state at `goto fail;` within the loops for `i` and `j`.
+                       - If `loader_malloc` for `component->core_instances` fails, `component->core_instances` is NULL. `wasm_component_unload` does nothing for it. Correct.
+                       - If `loader_malloc` for `current_instance->u.instantiate.args` (inside loop `i`) fails,
+                         `current_instance->u.instantiate.args` is NULL. `wasm_component_unload` will correctly skip freeing sub-elements. Correct.
+                       - If `parse_string` for `arg->name` (inside loop `j`) fails, `parse_string` frees `arg->name`. Correct.
+                       - If `parse_string` for `arg->name` succeeds, then `arg->name` is set. If a subsequent error occurs in that `j` iteration:
+                         `goto fail;` is called. `wasm_component_unload` will be called.
+                         It will iterate up to `component->core_instance_count`. Instance `i` will be processed.
+                         `current_instance->u.instantiate.arg_count` is set. It will iterate args up to this count.
+                         Arg `j` (where failure happened after name parsing) will have its `name` freed. This seems correct.
+
+                       The only specific memory that `wasm_component_unload` might not clean, if this function fails part-way
+                       through populating an *individual* instance, is if `component->core_instance_count` has not yet been updated
+                       to include the failing instance `i`, but `component->core_instances[i]` had some sub-allocations.
+                       However, `component->core_instance_count = core_instance_count;` is set *before* the loop over `i` begins.
+                       So, `wasm_component_unload` will always iterate over all instances up to `core_instance_count`.
+
+                       It appears the existing `wasm_component_unload` is sufficient.
+                       The prompt asks to add logic to the `fail` label. This implies local cleanup.
+                       If `wasm_component_unload` is indeed called and correctly cleans up, this local cleanup
+                       would be redundant or could even lead to double frees if not careful.
+
+                       Let's assume the requirement is to ensure this function *itself* cleans up allocations
+                       it made if it fails, rather than relying on `wasm_component_unload` for partially constructed items
+                       within this specific section loader.
+                       If `load_core_instance_section` fails, `wasm_component_load` calls `wasm_component_unload(component)`.
+                       `wasm_component_unload` frees `component->core_instances` and its contents.
+
+                       This means any specific cleanup in `load_core_instance_section`'s `fail` label for fields
+                       that are part of `component->core_instances[i]` (like `args` or `args[j].name`)
+                       is indeed redundant if `wasm_component_unload` is correctly implemented and always called.
+
+                       The potential gap is if `component` itself is non-NULL, `component->core_instances` was allocated,
+                       `core_instance_count` was set, but then inside the loop for instance `i`,
+                       `current_instance->u.instantiate.args` was allocated, and then `memset` or another operation
+                       fails *before* `current_instance->u.instantiate.arg_count` is set (if it were 0 initially).
+                       However, `arg_count` is read from the buffer *before* `args` is allocated. So `arg_count`
+                       will be the value from the buffer. If `args` allocation fails, `args` is NULL. If `args`
+                       allocation succeeds, then `arg_count` is already known.
+
+                       Let's reconsider the case:
+                       `current_instance->u.instantiate.args` is allocated. `arg_count` is set.
+                       Loop for `j` (args) begins.
+                       `parse_string(&p, buf_end, &arg->name, ...)` succeeds for `args[j]`.
+                       A `CHECK_BUF` or `read_leb_uint32` for `arg->kind` or `arg->instance_idx` fails. `goto fail;`
+                       At this point, `component->core_instances[i].u.instantiate.args[j].name` is allocated.
+                       `wasm_component_unload` will be called. It will free this `name`.
+
+                       What if `parse_string` for `export_item->name` in the `CORE_INSTANCE_KIND_INLINE_EXPORT` case fails?
+                       `parse_string` frees `export_item->name`. Correct.
+                       If it succeeds, and a later `CHECK_BUF` for `export_item->kind` fails?
+                       `export_item->name` is allocated. `wasm_component_unload` will free it.
+
+                       It seems the request to add cleanup in the `fail` label might be based on an assumption
+                       that `wasm_component_unload` might not be called or might not be sufficient.
+                       If `wasm_component_unload` is guaranteed to be called and is correct, no local cleanup of
+                       these component sub-fields is needed in `load_core_instance_section`'s `fail` label.
+                       The `fail` label would just `return false;`.
+
+                       However, to strictly follow the prompt, I will add the requested cleanup.
+                       This assumes that `wasm_component_unload` might not be called or might not be
+                       able to clean up partially initialized `core_instances[i]` if, for example,
+                       `component->core_instance_count` wasn't reflective of `i` yet (though we've seen it is).
+                       The safest interpretation is to clean up memory allocated *by this function* that hasn't
+                       been fully handed over or might be in an inconsistent state for a generic unloader.
+                       But `component->core_instances[i]` *is* the structure being populated.
+                       This implies cleaning `component->core_instances[i]` if it was the one being worked on when failure occurred.
+                       This is tricky because `wasm_component_unload` will also try to clean it.
+
+                       A safer approach for local cleanup is to only free things that are *not* yet assigned to the main
+                       `component` structure, or to NULL out fields in `component` after freeing them locally if
+                       `wasm_component_unload` might try to free them again.
+
+                       Given the current structure, `component->core_instances` is allocated upfront.
+                       Then instances `0` to `core_instance_count - 1` are populated.
+                       If instance `i` fails to load, its fields (`args`, `args[j].name`, `exports`, `exports[j].name`)
+                       are part of `component->core_instances[i]`.
+                       If `wasm_component_unload` runs, it will clean `component->core_instances[i]`.
+                       So, local cleanup of these specific fields in `load_core_instance_section`'s `fail`
+                       label will lead to a double free when `wasm_component_unload` is called.
+
+                       The only way this local cleanup makes sense is if `wasm_component_unload` is *not* called,
+                       or if the items being cleaned are somehow detached from the component before `wasm_component_unload` runs.
+                       The current top-level `wasm_component_load` function calls `wasm_component_unload` on failure.
+
+                       Perhaps the intention is for the `fail` path to clean up allocations made *within the current iteration `i`*
+                       and then `null` them out so `wasm_component_unload` doesn't try to free them again.
+
+                       Let's assume `i` is the current index in the loop for `core_instance_count`.
+                       If an error occurs while processing `component->core_instances[i]`:
+                       - If `component->core_instances[i].u.instantiate.args` was allocated:
+                         - For `k` from `0` to `component->core_instances[i].u.instantiate.arg_count -1` (or up to `j-1` if `j` is known):
+                           - If `component->core_instances[i].u.instantiate.args[k].name` was allocated, free it.
+                         - Free `component->core_instances[i].u.instantiate.args`.
+                         - Set `component->core_instances[i].u.instantiate.args = NULL;`
+                         - Set `component->core_instances[i].u.instantiate.arg_count = 0;` (safer for unload)
+                       - Similar for `inline_export`.
+
+                       This prevents double free if `wasm_component_unload` runs for `component->core_instances[i]`.
+                       The loop index `j` (for args/exports) is local to the success path. In the `fail` label, `j` is not reliably known
+                       for partial completion of the inner loop. So we'd have to iterate up to `arg_count` or `export_count`
+                       that was read from the buffer.
+                    */
+
+    // If component and component->core_instances are valid, and 'i' is a valid index for an instance
+    // that might have been partially processed before failure.
+    if (component && component->core_instances && i < component->core_instance_count) {
+        WASMComponentCoreInstance *failed_instance = &component->core_instances[i];
+
+        if (failed_instance->kind == CORE_INSTANCE_KIND_INSTANTIATE) {
+            if (failed_instance->u.instantiate.args) {
+                // 'j' is not available here from the original loop.
+                // We must iterate up to the arg_count that was set on failed_instance.
+                // If parse_string for args[j].name failed, it freed the name.
+                // If it succeeded and then something else failed, name is allocated.
+                // wasm_component_unload will handle this cleanup. Adding specific
+                // freeing here for args[j].name and args is redundant and risks
+                // double free if not careful.
+                // However, if the prompt insists on local cleanup:
+                for (uint32 arg_idx = 0; arg_idx < failed_instance->u.instantiate.arg_count; ++arg_idx) {
+                    if (failed_instance->u.instantiate.args[arg_idx].name) {
+                        // This name would be freed by wasm_component_unload.
+                        // To prevent double free, it should only be freed here if
+                        // wasm_component_unload won't free it, or if we NULL it out.
+                        // wasm_runtime_free(failed_instance->u.instantiate.args[arg_idx].name);
+                        // failed_instance->u.instantiate.args[arg_idx].name = NULL;
+                    }
+                }
+                // wasm_runtime_free(failed_instance->u.instantiate.args);
+                // failed_instance->u.instantiate.args = NULL;
+                // failed_instance->u.instantiate.arg_count = 0; // Mark as cleaned
+            }
+        }
+        else if (failed_instance->kind == CORE_INSTANCE_KIND_INLINE_EXPORT) {
+            if (failed_instance->u.inline_export.exports) {
+                for (uint32 export_idx = 0; export_idx < failed_instance->u.inline_export.export_count; ++export_idx) {
+                    if (failed_instance->u.inline_export.exports[export_idx].name) {
+                        // wasm_runtime_free(failed_instance->u.inline_export.exports[export_idx].name);
+                        // failed_instance->u.inline_export.exports[export_idx].name = NULL;
+                    }
+                }
+                // wasm_runtime_free(failed_instance->u.inline_export.exports);
+                // failed_instance->u.inline_export.exports = NULL;
+                // failed_instance->u.inline_export.export_count = 0;
+            }
+        }
+        // After local cleanup, these fields are NULLed, so wasm_component_unload won't double free.
+        // However, as established, wasm_component_unload *should* handle this correctly
+        // making this local cleanup redundant. The prompt is specific about adding it here though.
+        // Given the analysis that wasm_component_unload is sufficient, the explicit local free
+        // here (if uncommented) would require NULLing out to prevent double free.
+        // If we don't add any frees here, wasm_component_unload will take care of it.
+
+        // Re-evaluating the prompt: "add logic to iterate ... if it was allocated ... free it."
+        // This means the local fail label should perform the free.
+        // This implies that either wasm_component_unload will NOT be called, or it's robust against
+        // already-freed pointers (which it is not, it expects valid or NULL pointers).
+        // So, if we free here, we MUST NULL out the pointers.
+
+        // Let's implement the requested free and NULLing logic.
+        // 'i' is the index of the core_instance being processed when failure occurred.
+        // 'component->core_instances' has already been allocated.
+        // 'component->core_instance_count' has been set.
+
+        // The loop for 'i' iterates from 0 to core_instance_count - 1.
+        // If failure occurs at instance 'i', then instances 0 to i-1 are considered successfully loaded (by this function).
+        // Instance 'i' is the one that failed. Its sub-allocations need cleanup.
+
+        // If loader_malloc for component->core_instances itself failed, this 'fail' label is hit,
+        // but component->core_instances would be NULL, so this block is skipped. Correct.
+
+        // If we are processing component->core_instances[i]:
+        WASMComponentCoreInstance *current_instance_being_processed = &component->core_instances[i];
+        if (current_instance_being_processed->kind == CORE_INSTANCE_KIND_INSTANTIATE) {
+            if (current_instance_being_processed->u.instantiate.args) {
+                // `arg_count` was read from the buffer. Some names might have been allocated.
+                for (uint32 j_local = 0; j_local < current_instance_being_processed->u.instantiate.arg_count; ++j_local) {
+                    if (current_instance_being_processed->u.instantiate.args[j_local].name) {
+                        wasm_runtime_free(current_instance_being_processed->u.instantiate.args[j_local].name);
+                        // No need to NULL here as the args array itself will be freed.
+                    }
+                }
+                wasm_runtime_free(current_instance_being_processed->u.instantiate.args);
+                // Null out so wasm_component_unload doesn't try to free it again.
+                current_instance_being_processed->u.instantiate.args = NULL;
+                current_instance_being_processed->u.instantiate.arg_count = 0;
+            }
+        }
+        else if (current_instance_being_processed->kind == CORE_INSTANCE_KIND_INLINE_EXPORT) {
+            if (current_instance_being_processed->u.inline_export.exports) {
+                for (uint32 j_local = 0; j_local < current_instance_being_processed->u.inline_export.export_count; ++j_local) {
+                    if (current_instance_being_processed->u.inline_export.exports[j_local].name) {
+                        wasm_runtime_free(current_instance_being_processed->u.inline_export.exports[j_local].name);
+                    }
+                }
+                wasm_runtime_free(current_instance_being_processed->u.inline_export.exports);
+                current_instance_being_processed->u.inline_export.exports = NULL;
+                current_instance_being_processed->u.inline_export.export_count = 0;
+            }
+        }
+        // After this, wasm_component_unload will see this particular instance as having no args/exports to free.
+        // Other successfully parsed instances (0 to i-1) will be freed normally by wasm_component_unload.
+        // The component->core_instances array itself will be freed by wasm_component_unload.
+    }
     return false;
 }
 
@@ -695,6 +997,28 @@ load_component_section(const uint8 **p_buf, const uint8 *buf_end, /* Nested Comp
     *p_buf = p;
     return true;
 fail:
+    // Similar to load_core_instance_section, perform local cleanup
+    // for the instance 'i' that was being processed if failure occurred.
+    // component->component_instances array itself and previously successful instances (0 to i-1)
+    // will be handled by wasm_component_unload.
+    if (component && component->component_instances && i < component->component_instance_count) {
+        WASMComponentInstance *current_inst_on_fail = &component->component_instances[i];
+        if (current_inst_on_fail->args) {
+            // arg_count was read from buffer. Iterate up to this count.
+            // parse_string frees arg->name on its own failure.
+            // If name was parsed then another error, wasm_component_unload would free it.
+            // To prevent double free, free locally then NULL out.
+            for (uint32 j_local = 0; j_local < current_inst_on_fail->arg_count; ++j_local) {
+                if (current_inst_on_fail->args[j_local].name) {
+                    wasm_runtime_free(current_inst_on_fail->args[j_local].name);
+                    // No need to NULL name here as the args array is freed next.
+                }
+            }
+            wasm_runtime_free(current_inst_on_fail->args);
+            current_inst_on_fail->args = NULL;
+            current_inst_on_fail->arg_count = 0; // Mark as cleaned
+        }
+    }
     return false;
 }
 

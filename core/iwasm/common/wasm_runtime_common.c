@@ -3536,6 +3536,12 @@ wasm_runtime_init_wasi(WASMModuleInstanceCommon *module_inst,
         return false;
     }
 
+    if (os_mutex_init(&wasi_ctx->poll_lock) != BHT_OK) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Init wasi environment failed: init lock failed");
+        goto fail;
+    }
+
     wasm_runtime_set_wasi_ctx(module_inst, wasi_ctx);
 
     /* process argv[0], trip the path and suffix, only keep the program name
@@ -3870,6 +3876,13 @@ wasm_runtime_init_wasi(WASMModuleInstanceCommon *module_inst,
     ctx = runtime_malloc(sizeof(*ctx), module_inst, error_buf, error_buf_size);
     if (!ctx)
         return false;
+
+    if (os_mutex_init(&ctx->poll_lock) != BHT_OK) {
+        set_error_buf(error_buf, error_buf_size,
+                      "Init wasi environment failed: init lock failed");
+        goto fail;
+    }
+
     uvwasi = &ctx->uvwasi;
 
     /* Setup the initialization options */
@@ -4029,6 +4042,7 @@ wasm_runtime_destroy_wasi(WASMModuleInstanceCommon *module_inst)
         if (wasi_ctx->ns_lookup_list)
             wasm_runtime_free(wasi_ctx->ns_lookup_list);
 
+        os_mutex_destroy(&wasi_ctx->poll_lock);
         wasm_runtime_free(wasi_ctx);
     }
 }
@@ -4040,6 +4054,7 @@ wasm_runtime_destroy_wasi(WASMModuleInstanceCommon *module_inst)
 
     if (wasi_ctx) {
         uvwasi_destroy(&wasi_ctx->uvwasi);
+        os_mutex_destroy(&wasi_ctx->poll_lock);
         wasm_runtime_free(wasi_ctx);
     }
 }

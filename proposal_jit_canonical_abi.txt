@@ -1,0 +1,135 @@
+## Proposal: JIT Compilation for WebAssembly Canonical ABI in WAMR
+
+**Date:** October 26, 2023
+**Author:** AI Agent
+**Status:** Draft
+
+### 1. Introduction & Goals
+
+The WebAssembly Component Model introduces the **Canonical ABI** as a standardized way for WebAssembly components to interact with each other and with the host environment. It defines how high-level types (like strings, lists, records, variants, resources) are "lowered" into Wasm linear memory for component calls and "lifted" back into a structured representation for the host or another component. This process ensures interoperability but can introduce performance overhead due to the marshalling and unmarshalling logic.
+
+The **goal** of this proposal is to explore and define strategies for applying Just-In-Time (JIT) compilation techniques to the Canonical ABI operations within the WebAssembly Micro Runtime (WAMR). By JIT-compiling parts of the Canonical ABI logic, we aim to significantly improve the performance of inter-component calls and component-host interactions, making the Component Model more efficient for practical applications.
+
+### 2. Analysis of Canonical ABI Operations for JIT
+
+The core of the Canonical ABI involves two main operations:
+
+*   **`canon lift`**: This operation takes data from a component's linear memory (and potentially other Wasm state like tables) and translates it into a higher-level, structured representation. This is used when a component returns a value or when the host needs to read data from a component.
+*   **`canon lower`**: This operation takes a higher-level, structured representation of data and translates it into values that can be placed into a component's linear memory (using a `realloc` function provided by the component) and passed as Wasm function arguments. This is used when calling a component function or when the host provides data to a component.
+
+These operations are typically implemented as a sequence of steps defined by the Canonical ABI specification for each data type. For function calls across the ABI boundary, **thunks** are generated. These thunks are small pieces of code that adapt the caller's signature to the callee's signature, performing the necessary `lift` and `lower` operations for arguments and return values.
+
+**Performance-sensitive operations** within the Canonical ABI that are prime candidates for JIT compilation include:
+
+*   **String Conversions:**
+    *   Copying and transcoding strings between UTF-8 (used in Wasm linear memory) and UTF-16 (often used by hosts or other components).
+    *   Handling Latin1/UTF-16 representations.
+    *   Validating UTF-8/UTF-16 sequences.
+*   **Memory Management:**
+    *   Efficiently calling the `realloc` function (exported by a component or provided by the host) to allocate or grow memory for lowered data.
+    *   Managing the deallocation of memory used for lifted data on the host side or temporary buffers.
+*   **Marshalling of Complex Types:**
+    *   **Lists:** Iterating over list elements, lifting/lowering each element, and managing memory for the list structure itself.
+    *   **Records:** Accessing fields, potentially with different memory layouts, and lifting/lowering each field.
+    *   **Variants (and Enums):** Checking discriminants and lifting/lowering the appropriate payload.
+    *   **Options:** Handling the presence or absence of a value.
+    *   **Results:** Handling `ok` and `err` cases.
+    *   **Resources:** Managing resource handles and potentially interacting with resource tables.
+
+Currently, these operations in WAMR are likely handled by interpreted C code or pre-compiled C helper functions. JIT compilation can replace this with specialized machine code tailored to specific type signatures.
+
+### 3. Proposed JIT Strategies
+
+We propose a multi-faceted approach to JIT compilation for the Canonical ABI:
+
+*   **Strategy 1: JIT-Compiling Thunks (Primary Recommendation):**
+    *   This strategy focuses on JIT-compiling the entire thunk for a given function signature involved in a component call. When a component imports or exports a function, WAMR would analyze the function's signature (parameter types, result types).
+    *   For each unique signature, a specialized JIT-compiled thunk would be generated.
+    *   **`canon lower` thunk (for calls into a component):** This thunk would take host-side or JIT-friendly representations of arguments, generate optimized machine code to perform all necessary lowering steps (string conversions, list marshalling, calling `realloc` via an intrinsic or a call to a JIT-ted helper), and then make the actual Wasm function call.
+    *   **`canon lift` thunk (for results from a component):** This thunk would take results from Wasm linear memory/registers, generate optimized machine code to perform all lifting steps, and return them in a host-side or JIT-friendly representation.
+    *   This approach offers the most significant potential performance gain by minimizing transitions between JIT-ted code and C helper functions for the entire marshalling process of a function call.
+
+*   **Strategy 2: JIT-Compiling Common Canonical Helper Functions (Secondary/Complementary):**
+    *   Certain Canonical ABI operations are fundamental and frequently used, such as copying a UTF-8 string from linear memory and validating/transcoding it to UTF-16 for the host.
+    *   Instead of (or in addition to) JIT-compiling entire thunks, these common, self-contained helper functions could be JIT-compiled. For instance, a `jit_lift_string_from_memory(address, length)` function could be generated.
+    *   The JIT-ted thunks (from Strategy 1) or even the existing C-based ABI implementation could then call these JIT-ted helpers, benefiting from optimized code for these specific, hot operations.
+    *   This strategy can be a good intermediate step and can also complement Strategy 1 by providing optimized building blocks.
+
+*   **Strategy 3: Direct JIT of Canonical Op Sequences (Future Consideration):**
+    *   This is a more advanced and complex strategy. The Canonical ABI defines a sequence of primitive operations (e.g., `memory_get`, `list_new`, `string_lift`, `call_func`).
+    *   A specialized JIT compiler could, in theory, directly consume these canonical operation sequences (perhaps represented as an intermediate representation) and generate machine code for them.
+    *   This would offer the highest level of optimization flexibility but also poses the greatest implementation challenge. It might be considered a long-term research direction.
+
+### 4. Integration with WAMR's JIT Frameworks
+
+WAMR currently supports multiple JIT frameworks. The integration approach will differ based on the framework:
+
+*   **LLVM JIT (Primary Focus for Canonical ABI):**
+    *   The LLVM JIT is well-suited for the complex code generation and optimization required for Canonical ABI thunks and helpers due to its powerful optimization passes and mature infrastructure.
+    *   **Component Type Information:** The JIT will need access to parsed component type information (function signatures, record layouts, variant discriminants, etc.). This information will guide the generation of LLVM IR for marshalling/unmarshalling logic.
+    *   **LLVM IR Generation:**
+        *   For `canon lower`, the JIT would generate IR to:
+            *   Read input values (from host structures or JIT registers).
+            *   Perform type-specific conversions (e.g., string transcoding).
+            *   Call the Wasm `realloc` function (likely via a dedicated intrinsic or a call to a runtime helper that then calls the Wasm function) to allocate space in linear memory.
+            *   Write the lowered values into the allocated linear memory.
+            *   Prepare arguments for the Wasm function call.
+        *   For `canon lift`, the JIT would generate IR to:
+            *   Read values from Wasm linear memory or Wasm registers.
+            *   Perform type-specific conversions.
+            *   Allocate memory on the host side (if necessary) for the lifted values.
+            *   Construct the host-side representation of the data.
+    *   **New LLVM IR Intrinsics/Patterns:** We might need to define new LLVM IR intrinsics or specific code generation patterns for common ABI tasks, such as:
+        *   `wamr.canon.realloc(size)`: To invoke the component's `realloc`.
+        *   `wamr.canon.lift_string(addr, len)` / `wamr.canon.lower_string(str_ref, str_len)`: For optimized string operations.
+        *   Accessing Wasm linear memory directly and safely from JIT-ted ABI code.
+
+*   **Fast JIT:**
+    *   The Fast JIT is designed for simpler, quicker compilation with fewer optimizations. It might be suitable for:
+        *   Extremely simple and very hot helper functions identified in Strategy 2, where the overhead of LLVM JIT might be too high for tiny functions. For example, a JIT-ted helper to simply copy a sequence of bytes from linear memory to a host buffer without complex transcoding.
+    *   However, the complexity of most Canonical ABI operations, especially those involving memory allocation and detailed type introspection, makes LLVM JIT the more appropriate primary target.
+
+### 5. Key Technical Challenges
+
+*   **Representing and Using Component Type Information:** The JIT compiler needs an efficient way to access and interpret the detailed type information from the component model (e.g., record field names and types, variant cases, list element types) to generate correct marshalling code.
+*   **Memory Management and Interaction:**
+    *   Coordinating memory allocation/deallocation between JIT-ted code, the Wasm module's linear memory (via `realloc`), and the host environment.
+    *   Ensuring safety and correctness when JIT-ted code reads from or writes to Wasm linear memory. This includes bounds checking if not implicitly handled by the operations.
+    *   Managing the lifetime of data, especially for lifted values.
+*   **Calling Conventions:** Defining stable and efficient calling conventions for JIT-ted thunks, including how they receive input from the caller (host or another JIT-ted Wasm function) and how they pass arguments to the callee (Wasm function or host).
+*   **Dynamic Code Generation:** Efficiently generating and managing JIT-ted code for numerous function signature-specific thunks. This includes caching and reusing JIT-ted thunks for identical signatures.
+*   **Interfacing JIT-ted ABI Thunks with JIT-ted Wasm:** Ensuring seamless calls between JIT-ted core Wasm functions and JIT-ted ABI thunks, minimizing overhead at this boundary. This might involve aligning calling conventions or using specialized trampolines.
+*   **Error Handling:** Propagating errors that occur during Canonical ABI operations (e.g., allocation failure, invalid data) from JIT-ted code back to the caller.
+
+### 6. Suggested Phased Implementation
+
+1.  **Phase 1: Profiling & Bottleneck Identification:**
+    *   Before significant JIT work, conduct thorough profiling of existing WAMR applications using the Canonical ABI (if available, or using representative benchmarks).
+    *   Identify the most time-consuming C helper functions or interpreted parts of the current Canonical ABI implementation. This will confirm the areas that will benefit most from JIT compilation.
+
+2.  **Phase 2: Proof-of-Concept for Simple Thunks (LLVM JIT):**
+    *   Target a few simple function signatures involving only primitive Wasm types (i32, i64, f32, f64) and potentially basic string passing (e.g., lifting a UTF-8 string from linear memory to a host string, and lowering a host string to linear memory).
+    *   Implement JIT compilation (using LLVM JIT) for the `canon lift` and `canon lower` thunks for these simple signatures.
+    *   Develop mechanisms for the JIT to access necessary type information and interact with Wasm linear memory (including calling `realloc`).
+
+3.  **Phase 3: Support for Complex Types:**
+    *   Incrementally extend JIT support for thunks handling more complex types:
+        *   Lists (fixed-size and variable-size).
+        *   Records.
+        *   Variants and Enums.
+        *   Options and Results.
+    *   This will involve more intricate LLVM IR generation, especially for loops, conditional logic based on types, and memory management for nested structures.
+
+4.  **Phase 4: Optimization and Benchmarking:**
+    *   Focus on optimizing the LLVM JIT's output for ABI-specific code. This might involve custom LLVM passes or tuning existing ones.
+    *   Develop comprehensive benchmarks comparing the performance of JIT-ted Canonical ABI operations against the existing C-helper/interpreted implementation.
+    *   Investigate the JIT compilation of common helper functions (Strategy 2) if profiling shows specific C helpers are still bottlenecks.
+
+### 7. Expected Benefits
+
+*   **Reduced Overhead:** Significant reduction in the function call overhead when crossing the Canonical ABI boundary between components or between a component and the host.
+*   **Faster Data Marshalling:** Optimized machine code for string conversions, list processing, and other type marshalling/unmarshalling tasks will lead to faster data exchange.
+*   **Improved Overall Performance:** Applications built using the WebAssembly Component Model in WAMR will see improved end-to-end performance, especially those making frequent inter-component calls or host interactions with complex data types.
+*   **Enabling More Fine-Grained Components:** Lower ABI overhead could encourage the development of more modular, fine-grained components, as the performance penalty for inter-component communication would be reduced.
+
+This proposal outlines a path to significantly enhance the performance of the WebAssembly Component Model in WAMR through the strategic application of JIT compilation to the Canonical ABI.

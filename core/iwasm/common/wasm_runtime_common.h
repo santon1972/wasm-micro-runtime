@@ -559,11 +559,13 @@ typedef struct WASIContext {
     char *env_buf;
     char **env_list;
     uint32_t exit_code;
+    korp_mutex poll_lock; /* Lock for wasi_poll_oneoff */
 } WASIContext;
 #else
 typedef struct WASIContext {
     uvwasi_t uvwasi;
     uint32_t exit_code;
+    korp_mutex poll_lock; /* Lock for wasi_poll_oneoff */
 } WASIContext;
 #endif
 #endif

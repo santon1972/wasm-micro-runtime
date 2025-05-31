@@ -1088,10 +1088,14 @@ wasi_poll_oneoff(wasm_exec_env_t exec_env, const wasi_subscription_t *in,
     if (!wasi_ctx)
         return (wasi_errno_t)-1;
 
+    os_mutex_lock(&wasi_ctx->poll_lock);
+
     if (!validate_native_addr((void *)in, (uint64)sizeof(wasi_subscription_t))
         || !validate_native_addr(out, (uint64)sizeof(wasi_event_t))
-        || !validate_native_addr(nevents_app, (uint64)sizeof(uint32)))
+        || !validate_native_addr(nevents_app, (uint64)sizeof(uint32))) {
+        os_mutex_unlock(&wasi_ctx->poll_lock);
         return (wasi_errno_t)-1;
+    }
 
 #if WASM_ENABLE_THREAD_MGR == 0
     err = wasmtime_ssp_poll_oneoff(exec_env, curfds, in, out, nsubscriptions,
@@ -1100,10 +1104,13 @@ wasi_poll_oneoff(wasm_exec_env_t exec_env, const wasi_subscription_t *in,
     err = execute_interruptible_poll_oneoff(curfds, in, out, nsubscriptions,
                                             &nevents, exec_env);
 #endif
-    if (err)
+    if (err) {
+        os_mutex_unlock(&wasi_ctx->poll_lock);
         return err;
+    }
 
     *nevents_app = (uint32)nevents;
+    os_mutex_unlock(&wasi_ctx->poll_lock);
     return 0;
 }
 
