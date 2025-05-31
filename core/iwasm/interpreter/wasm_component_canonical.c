@@ -1861,9 +1861,9 @@ wasm_component_canon_lower_value(
         
         // 3. Lower each element into the allocated Wasm memory
         uint32 current_offset_in_wasm_struct = 0;
-        for (uint32 i = 0; i < tuple_type->field_count; ++i) {
+        for (uint32 i = 0; i < tuple_type->element_count; ++i) {
             void *host_elem_ptr = component_elements_ptrs[i];
-            WASMComponentValType *element_val_type = tuple_type->fields[i].valtype;
+            WASMComponentValType *element_val_type = &tuple_type->element_valtypes[i];
             uint8 element_target_core_type = VALUE_TYPE_VOID; // The type of the data being written into wasm memory for this element
 
             // Determine the target core type for the recursive call

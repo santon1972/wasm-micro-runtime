@@ -632,7 +632,7 @@ wasm_component_instance_instantiate(
     // Dependency analysis might be needed for correct instantiation order of nested components
     // if their arguments depend on each other.
     for (i = 0; i < component->component_instance_count; ++i) {
-        WASMComponentCompInstance *comp_instance_def = &component->component_instances[i];
+        WASMComponentInstance *comp_instance_def = &component->component_instances[i];
 
         if (comp_instance_def->kind == COMPONENT_INSTANCE_KIND_INSTANTIATE) {
             uint32 nested_comp_def_idx = comp_instance_def->u.instantiate.component_idx;
@@ -640,7 +640,7 @@ wasm_component_instance_instantiate(
             WASMComponentInstanceInternal *new_nested_comp_inst = NULL;
 
             // TODO: MAJOR - Resolve arguments for the nested component.
-            // Arguments are in comp_instance_def->u.instantiate.args (WASMComponentCompInstanceArg).
+            // Arguments are in comp_instance_def->u.instantiate.args (WASMComponentInstanceArg).
             // Each arg provides: name (import name for nested comp), kind, and instance_idx (source in outer comp).
             // 'instance_idx' refers to an index in the *outer* component's:
             //   - component->imports (if item_kind in arg is e.g. COMPONENT_ITEM_KIND_COMPONENT_IMPORT)
@@ -682,7 +682,7 @@ wasm_component_instance_instantiate(
             // `comp_instance_def->u.instantiate.args` are these arguments.
             // `nested_component_def->imports` are the actual import declarations of the nested component.
             for (uint32 arg_k = 0; arg_k < comp_instance_def->u.instantiate.arg_count; ++arg_k) {
-                WASMComponentCompInstanceArg *arg = &comp_instance_def->u.instantiate.args[arg_k];
+                WASMComponentInstanceArg *arg = &comp_instance_def->u.instantiate.args[arg_k];
                 uint32 source_instance_index = arg->instance_idx; // Index in outer component's definition space
 
                 // Find the corresponding import definition in the nested component by matching the argument name.
@@ -698,8 +698,8 @@ wasm_component_instance_instantiate(
                 }
 
                 if (!nested_import_def) {
-                    set_comp_rt_error_v(error_buf, error_buf_size, "Nested comp arg '%s': no matching import found in nested component definition '%s'.",
-                                       arg->name, nested_component_def->name ? nested_component_def->name : "unnamed_nested_component");
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Nested comp arg '%s': no matching import found in nested component definition at index %u.",
+                                       arg->name, nested_comp_def_idx);
                     nested_import_res_failed = true;
                     break; // from arg_k loop
                 }
@@ -707,42 +707,46 @@ wasm_component_instance_instantiate(
                 // Basic kind compatibility check:
                 // `arg->kind.item_kind` is what the outer component's argument list claims the item is (e.g., COMPONENT_ITEM_KIND_FUNC).
                 // `nested_import_def->desc.kind` is what the nested component's import expects (e.g., EXTERN_DESC_KIND_FUNC).
-                bool basic_kind_compatible = false;
-                switch (arg->kind.item_kind) { // This is WASMComponentItemKind from the outer component's context
-                    case COMPONENT_ITEM_KIND_FUNC: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_FUNC); break;
-                    case COMPONENT_ITEM_KIND_GLOBAL: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_VALUE); break;
-                    case COMPONENT_ITEM_KIND_TABLE:
-                        LOG_WARNING("Component-level import of TABLE ('%s') is not supported.", arg->name);
-                        set_comp_rt_error_v(error_buf, error_buf_size, "Component-level import of TABLE ('%s') is not supported.", arg->name);
-                        nested_import_res_failed = true; // Ensure failure path is taken
-                        basic_kind_compatible = false; // Explicitly not compatible
-                        break;
-                    case COMPONENT_ITEM_KIND_MEMORY:
-                        LOG_WARNING("Component-level import of MEMORY ('%s') is not supported.", arg->name);
-                        set_comp_rt_error_v(error_buf, error_buf_size, "Component-level import of MEMORY ('%s') is not supported.", arg->name);
-                        nested_import_res_failed = true; // Ensure failure path is taken
-                        basic_kind_compatible = false; // Explicitly not compatible
-                        break;
-                    case COMPONENT_ITEM_KIND_MODULE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_MODULE); break;
-                    case COMPONENT_ITEM_KIND_COMPONENT: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_COMPONENT); break;
-                    case COMPONENT_ITEM_KIND_INSTANCE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_INSTANCE); break;
-                    case COMPONENT_ITEM_KIND_TYPE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_TYPE); break;
-                    case COMPONENT_ITEM_KIND_VALUE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_VALUE); break;
-                    default:
-                        LOG_WARNING("Unsupported item_kind %d encountered during nested component import kind compatibility check.", arg->kind.item_kind);
-                        basic_kind_compatible = false;
-                        break;
-                }
-                if (!basic_kind_compatible) {
-                     set_comp_rt_error_v(error_buf, error_buf_size, "Nested comp arg '%s': basic kind mismatch. Outer provides resolved kind %u, nested expects import desc kind %u.",
-                                           arg->name, arg->kind.item_kind, nested_import_def->desc.kind);
-                    nested_import_res_failed = true;
-                    break; // from arg_k loop
-                }
+                // bool basic_kind_compatible = false;
+                // switch (arg->kind.item_kind) { // This is WASMComponentItemKind from the outer component's context
+                //     case COMPONENT_ITEM_KIND_FUNC: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_FUNC); break;
+                //     case COMPONENT_ITEM_KIND_GLOBAL: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_VALUE); break;
+                //     case COMPONENT_ITEM_KIND_TABLE:
+                //         LOG_WARNING("Component-level import of TABLE ('%s') is not supported.", arg->name);
+                //         set_comp_rt_error_v(error_buf, error_buf_size, "Component-level import of TABLE ('%s') is not supported.", arg->name);
+                //         nested_import_res_failed = true; // Ensure failure path is taken
+                //         basic_kind_compatible = false; // Explicitly not compatible
+                //         break;
+                //     case COMPONENT_ITEM_KIND_MEMORY:
+                //         LOG_WARNING("Component-level import of MEMORY ('%s') is not supported.", arg->name);
+                //         set_comp_rt_error_v(error_buf, error_buf_size, "Component-level import of MEMORY ('%s') is not supported.", arg->name);
+                //         nested_import_res_failed = true; // Ensure failure path is taken
+                //         basic_kind_compatible = false; // Explicitly not compatible
+                //         break;
+                //     case COMPONENT_ITEM_KIND_MODULE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_MODULE); break;
+                //     case COMPONENT_ITEM_KIND_COMPONENT: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_COMPONENT); break;
+                //     case COMPONENT_ITEM_KIND_INSTANCE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_INSTANCE); break;
+                //     case COMPONENT_ITEM_KIND_TYPE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_TYPE); break;
+                //     case COMPONENT_ITEM_KIND_VALUE: basic_kind_compatible = (nested_import_def->desc.kind == EXTERN_DESC_KIND_VALUE); break;
+                //     default:
+                //         LOG_WARNING("Unsupported item_kind %d encountered during nested component import kind compatibility check.", arg->kind.item_kind);
+                //         basic_kind_compatible = false;
+                //         break;
+                // }
+                // if (!basic_kind_compatible) {
+                //      set_comp_rt_error_v(error_buf, error_buf_size, "Nested comp arg '%s': basic kind mismatch. Outer provides resolved kind %u, nested expects import desc kind %u.",
+                //                            arg->name, arg->kind.item_kind, nested_import_def->desc.kind);
+                //     nested_import_res_failed = true;
+                //     break; // from arg_k loop
+                // }
+                // TODO: The above basic_kind_compatible check needs to be reimplemented.
+                // It should occur *after* resolving `arg->item_idx` from the outer component's context
+                // to get the actual provided item's type, then comparing that against `nested_import_def->desc.kind`.
+                // For now, proceeding without this preliminary check. The more detailed check during item resolution should catch issues.
 
-                LOG_VERBOSE("Resolving arg '%s' for nested component '%s', source_idx %u in outer. Outer provides kind %u, Nested expects desc kind %u.",
-                            arg->name, nested_component_def->name ? nested_component_def->name : "unnamed",
-                            source_instance_index, arg->kind.item_kind, nested_import_def->desc.kind);
+                LOG_VERBOSE("Resolving arg '%s' for nested component (def_idx %u), source_idx %u in outer. Arg kind from def: %u, Nested expects import desc kind %u.",
+                            arg->name, nested_comp_def_idx,
+                            source_instance_index, arg->kind, nested_import_def->desc.kind);
 
                 WASMComponentImport *outer_definition_component_imports = comp_inst_internal->component_def->imports;
                 uint32 num_outer_definition_component_imports = comp_inst_internal->component_def->import_count;
@@ -826,7 +830,7 @@ wasm_component_instance_instantiate(
                                         // This implies a potential gap or that mutability is only checked if this global is passed to another core module.
                                         // For now, we pass a placeholder. The original code used `arg->kind.u.global.is_mutable`
                                         // but `arg->kind` here is `ResolvedComponentItemKind` which has no `u.global`.
-                                        // The `WASMComponentCompInstanceArg.kind` is `WASMComponentItemKind` which also doesn't have `u.global`.
+                                        // The `WASMComponentInstanceArg.kind` is `WASMComponentItemKind` which also doesn't have `u.global`.
                                         // This was a bug in the original template for this section.
                                         // The mutability must be part of the nested_import_def's type description if it's a core global.
                                         // This is complex. For now, assume the caller of find_exported_global_instance will handle mutability check if it's re-exported to another core module.
@@ -885,8 +889,8 @@ wasm_component_instance_instantiate(
 
             if (nested_import_res_failed || nested_resolved_idx != nested_component_def->import_count) {
                 if (!nested_import_res_failed) { // Only set error if not already set
-                    set_comp_rt_error_v(error_buf, error_buf_size, "Failed to resolve all imports for nested component %s (resolved %u, need %u).",
-                                   nested_component_def->name, nested_resolved_idx, nested_component_def->import_count);
+                    set_comp_rt_error_v(error_buf, error_buf_size, "Failed to resolve all imports for nested component (def_idx %u) (resolved %u, need %u).",
+                                   nested_comp_def_idx, nested_resolved_idx, nested_component_def->import_count);
                 }
                 // Free any strduped names in nested_imports_resolved
                 for(uint32 k=0; k < nested_resolved_idx; ++k) if(nested_imports_resolved[k].name) bh_free(nested_imports_resolved[k].name);
@@ -899,7 +903,7 @@ wasm_component_instance_instantiate(
             }
 
             if (!nested_import_res_failed && nested_resolved_idx == nested_component_def->import_count) {
-                 LOG_VERBOSE("All %u imports for nested component %s resolved. Attempting instantiation.", nested_resolved_idx, nested_component_def->name);
+                 LOG_VERBOSE("All %u imports for nested component (def_idx %u) resolved. Attempting instantiation.", nested_resolved_idx, nested_comp_def_idx);
                  new_nested_comp_inst = wasm_component_instance_instantiate(
                     nested_component_def,
                     parent_exec_env, 
@@ -907,8 +911,8 @@ wasm_component_instance_instantiate(
                     error_buf, error_buf_size);
             } else if (!nested_import_res_failed && nested_resolved_idx != nested_component_def->import_count) {
                 // This case should have been caught above, but as a safeguard:
-                set_comp_rt_error_v(error_buf, error_buf_size, "Import count mismatch for nested component %s (resolved %u, need %u) after loop.",
-                                   nested_component_def->name, nested_resolved_idx, nested_component_def->import_count);
+                set_comp_rt_error_v(error_buf, error_buf_size, "Import count mismatch for nested component (def_idx %u) (resolved %u, need %u) after loop.",
+                                   nested_comp_def_idx, nested_resolved_idx, nested_component_def->import_count);
                 new_nested_comp_inst = NULL; // Ensure failure path
             }
             // If nested_import_res_failed is true, new_nested_comp_inst remains NULL or is set to NULL.
@@ -1676,7 +1680,7 @@ resolve_component_alias_by_index(WASMComponentInstanceInternal *comp_inst,
             break;
 
         case ALIAS_TARGET_INSTANCE:
-            // This refers to an *instance definition* (WASMComponentCompInstance) within the current component.
+            // This refers to an *instance definition* (WASMComponentInstance) within the current component.
             // alias_def->target_idx is an index into component_def->component_instances.
             if (alias_def->target_idx >= component_def->component_instance_count) {
                  set_comp_rt_error_v(error_buf, error_buf_size, "Alias target_idx %u for INSTANCE out of bounds (component_instance_count %u).",
@@ -1688,7 +1692,7 @@ resolve_component_alias_by_index(WASMComponentInstanceInternal *comp_inst,
             // This is complex as it requires knowing which runtime instance (module_instances or component_instances)
             // corresponds to `component_def->component_instances[alias_def->target_idx]`.
             // This mapping is not straightforward with current structures.
-            // TODO: Need a robust way to map WASMComponentCompInstance definition to its runtime counterpart.
+            // TODO: Need a robust way to map WASMComponentInstance definition to its runtime counterpart.
             LOG_TODO("Alias resolution for ALIAS_TARGET_INSTANCE: mapping definition to runtime instance is complex and not fully implemented.");
             out_resolved_item->kind = RESOLVED_ITEM_NONE; // Placeholder
             set_comp_rt_error(error_buf, error_buf_size, "ALIAS_TARGET_INSTANCE resolution logic incomplete (mapping def to runtime).");

@@ -51,6 +51,39 @@ typedef struct ResolvedComponentImportItem {
     } item;
 } ResolvedComponentImportItem;
 
+// Structure to represent resolved export items of a component instance
+// Forward declare LiftedFuncThunkContext if its definition is not included above this point
+struct LiftedFuncThunkContext;
+
+typedef struct ResolvedComponentExportItem {
+    char *name; // Name of the export
+    /* kind should align with WASMComponentExportKind enum from wasm_component_loader.h if applicable,
+       or a runtime-specific kind enum. Using uint8 if actual enum is not defined here. */
+    uint8 kind; /* ResolvedComponentExportItemKind or WASMComponentExportKind */
+    uint32 type_annotation_idx; /* Optional: type index for the export's description */
+
+    union {
+        // For a core module item being exported (e.g. a function from an inner module)
+        WASMFunctionInstance *function; // Used if kind is core function
+        WASMMemoryInstance *memory;
+        WASMTableInstance *table;
+        WASMGlobalInstance *global;
+
+        // For a nested component instance being exported
+        WASMComponentInstanceInternal *component_instance; // Used if kind is INSTANCE or COMPONENT (runtime representation)
+
+        // For a component-level function (lifted/lowered)
+        struct LiftedFuncThunkContext *function_thunk_context; // Used for EXPORT_KIND_FUNC
+
+        // For a type definition being exported
+        WASMComponentDefinedType *type_definition; // Used for EXPORT_KIND_TYPE
+
+        // For a value being exported (actual runtime representation of the value)
+        void *value_ptr; // Used for EXPORT_KIND_VALUE, type depends on value_type_idx from export_def
+
+    } item;
+} ResolvedComponentExportItem;
+
 
 /**
  * Represents a runtime instance of a WebAssembly Component.
@@ -69,13 +102,17 @@ struct WASMComponentInstanceInternal {
 
     /* TODO: Resolved exports of this component instance */
     // void *exports; 
+    ResolvedComponentExportItem *resolved_exports;
+    uint32 num_resolved_exports;
 
     /* TODO: Resolved imports provided to this component instance */
     // void *resolved_imports; 
+    ResolvedComponentImportItem *resolved_imports;
+    uint32 num_resolved_imports;
 
     /* Execution environment, if one is exclusively owned by this component instance.
        Often, exec_env might be passed in per call to an exported function. */
-    // WASMExecEnv *exec_env;
+    WASMExecEnv *exec_env;
 
     /* Internal bookkeeping */
     // Map from core_instance_def_idx to index in module_instances array.
