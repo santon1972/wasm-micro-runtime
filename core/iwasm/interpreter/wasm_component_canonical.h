@@ -134,6 +134,39 @@ wasm_component_canon_resource_rep(
     void *core_value_write_ptr,                  /* Output: int32_t representation (usually the handle itself) */
     char *error_buf, uint32 error_buf_size);
 
+/*
+ * Transcodes a UTF-16LE string (typically from Wasm memory) to a new
+ * host-allocated UTF-8 string. Caller is responsible for freeing the returned string
+ * using `loader_free()`.
+ *
+ * @param utf16_ptr Pointer to the source UTF-16LE string.
+ * @param utf16_code_units Number of UTF-16 code units in the source string.
+ * @param out_utf8_len_bytes Output parameter; on success, number of bytes in the resulting UTF-8 string (excluding null terminator).
+ * @param error_buf Buffer for error messages.
+ * @param error_buf_size Size of the error buffer.
+ * @return Pointer to the null-terminated UTF-8 string on success, or NULL on failure.
+ */
+char*
+transcode_utf16le_to_utf8_on_host(const uint16 *utf16_ptr, uint32 utf16_code_units,
+                                  uint32 *out_utf8_len_bytes,
+                                  char *error_buf, uint32 error_buf_size);
+
+/*
+ * Transcodes a UTF-8 string to a new host-allocated UTF-16LE string.
+ * Caller is responsible for freeing the returned buffer using `loader_free()`.
+ *
+ * @param utf8_str Pointer to the source UTF-8 string.
+ * @param utf8_len_bytes Number of bytes in the source UTF-8 string.
+ * @param out_utf16_code_units Output parameter; on success, number of UTF-16 code units in the resulting string.
+ * @param error_buf Buffer for error messages.
+ * @param error_buf_size Size of the error buffer.
+ * @return Pointer to the UTF-16LE string data on success, or NULL on failure. The buffer is NOT null-terminated in terms of uint16_t.
+ */
+uint16*
+transcode_utf8_to_utf16le_on_host(const char *utf8_str, uint32 utf8_len_bytes,
+                                  uint32 *out_utf16_code_units,
+                                  char *error_buf, uint32 error_buf_size);
+
 
 #ifdef __cplusplus
 } /* end of extern "C" */

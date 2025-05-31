@@ -8,6 +8,7 @@
 #include "aot_compiler.h"
 #include "aot_emit_exception.h"
 #include "aot_emit_table.h"
+#include "aot_llvm_canonical.h"
 #include "../aot/aot_runtime.h"
 #include "../aot/aot_intrinsic.h"
 #include "../interpreter/wasm_runtime.h"

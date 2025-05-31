@@ -119,6 +119,8 @@ if (NOT DEFINED WAMR_BUILD_REF_TYPES)
   set (WAMR_BUILD_REF_TYPES 1)
 endif ()
 
+option(WAMR_BUILD_JIT_CANONICAL_ABI "Enable JIT compilation for Canonical ABI thunks (experimental)" OFF)
+
 set (WAMR_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 include (${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake)
@@ -128,6 +130,19 @@ if (NOT WIN32)
                                        -ffunction-sections -fdata-sections \
                                        -Wno-unused-parameter -Wno-pedantic \
                                        -fvisibility=hidden")
+
+# Add compile definition for JIT Canonical ABI based on option
+if(WAMR_BUILD_JIT_CANONICAL_ABI)
+  if(WAMR_BUILD_JIT GREATER_EQUAL 1 OR WAMR_BUILD_AOT) # AOT implies LLVM context is available
+    add_compile_definitions(WAMR_ENABLE_JIT_CANONICAL_ABI=1)
+    message(STATUS "JIT for Canonical ABI thunks enabled (experimental)")
+  else()
+    message(WARNING "WAMR_BUILD_JIT_CANONICAL_ABI is ON but neither WAMR_BUILD_JIT nor WAMR_BUILD_AOT is enabled. JIT for Canonical ABI will not be functional.")
+    add_compile_definitions(WAMR_ENABLE_JIT_CANONICAL_ABI=0) # Explicitly set to 0 if dependencies not met
+  endif()
+else()
+  add_compile_definitions(WAMR_ENABLE_JIT_CANONICAL_ABI=0)
+endif()
   # Remove the extra spaces for better make log
   string (REGEX REPLACE "  *" " " CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wformat -Wformat-security -Wno-unused")

@@ -6,6 +6,13 @@
 #ifndef _WASM_COMMON_H
 #define _WASM_COMMON_H
 
+/* CMake-defined: 1 if JIT for Canonical ABI thunks is enabled, 0 otherwise.
+ * Default to 0 if not explicitly set by CMake (e.g. when building standalone files).
+ */
+#ifndef WAMR_ENABLE_JIT_CANONICAL_ABI
+#define WAMR_ENABLE_JIT_CANONICAL_ABI 0
+#endif
+
 #include "bh_platform.h"
 #include "bh_common.h"
 #include "wasm_exec_env.h"

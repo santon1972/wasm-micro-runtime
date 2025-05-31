@@ -6,10 +6,16 @@
 #include "wasm_component_runtime.h"
 #include "wasm_component_loader.h" /* For WASMComponent structure details */
 #include "wasm_runtime.h"          /* For wasm_instantiate, wasm_deinstantiate */
-#include "wasm_loader.h"           /* For wasm_module_destroy (if needed for component def) */
+#include "wasm_loader.h"           /* For wasm_module_destroy (if needed for component def), wasm_loader_destroy_comp_func_type */
 #include "../common/bh_log.h"
-#include "../common/bh_platform.h" /* For bh_malloc, bh_free, memset */
+#include "../common/bh_platform.h" /* For bh_malloc, bh_free, memset, bh_memcpy_s */
 #include "wasm_memory.h"        /* For wasm_runtime_validate_app_addr, etc. */
+/* Headers for JITting Canonical Thunks */
+#include "../compilation/aot_compiler.h"    /* For AOTCompContext, aot_create_comp_context, etc. */
+#include "../compilation/aot_llvm.h"        /* For LLVM-specific JIT context fields if needed by compile_and_get_jit_function_addr */
+#include "../compilation/aot_llvm_canonical.h" /* For aot_compile_lift_primitive_thunk, etc. */
+/* Ensure wasm_runtime_common.h is included for WAMR_ENABLE_JIT_CANONICAL_ABI */
+#include "../common/wasm_runtime_common.h"
 
 
 // Helper to set component runtime error messages
@@ -76,6 +82,102 @@ find_exported_memory_instance(WASMModuleInstance *module_inst, const char *name,
     set_comp_rt_error_v(error_buf, error_buf_size, "Memory export '%s' not found in source instance.", name);
     return NULL;
 }
+
+/* Placeholder for JIT option check. Uses the C macro defined in wasm_runtime_common.h */
+static bool is_jit_canonical_abi_enabled(WASMModuleInstance *module_inst) {
+    (void)module_inst; // module_inst might be used later for finer-grained control
+#if WAMR_ENABLE_JIT_CANONICAL_ABI == 1
+    // Further check if the JIT engine itself is enabled for this module_inst if necessary
+    // For example, if module_inst->aot_comp_opt.is_jit_mode is relevant
+    return true;
+#else
+    return false;
+#endif
+}
+
+/*
+ * Placeholder for the JIT compilation trigger.
+ * This function would normally interact with the LLVM JIT engine.
+ * For now, it logs intent and returns NULL.
+ */
+static void* compile_and_get_jit_function_addr(AOTCompContext *comp_ctx, LLVMValueRef llvm_func, const char* func_name) {
+    if (!llvm_func) {
+        LOG_WARNING("JIT-THUNK: llvm_func is NULL for thunk: %s", func_name ? func_name : "unnamed_thunk");
+        return NULL;
+    }
+    LOG_VERBOSE("JIT-THUNK: Stubbing JIT compilation for thunk: %s. LLVMValueRef: %p",
+                func_name ? func_name : "unnamed_thunk", (void*)llvm_func);
+
+    (void)comp_ctx; // Unused in stub
+    return NULL; // Placeholder: JIT compilation not hooked up.
+}
+
+// Helper to allocate and initialize WASMComponentFuncJITThunks
+static WASMComponentFuncJITThunks*
+create_jit_thunks_holder(uint32 num_params, uint32 num_results, char* error_buf, uint32 error_buf_size) {
+    WASMComponentFuncJITThunks *thunks = loader_malloc(sizeof(WASMComponentFuncJITThunks), error_buf, error_buf_size);
+    if (!thunks) return NULL;
+    memset(thunks, 0, sizeof(WASMComponentFuncJITThunks));
+
+    thunks->num_params = num_params;
+    thunks->num_results = num_results;
+
+    if (num_params > 0) {
+        thunks->param_lower_thunks = loader_malloc(num_params * sizeof(void*), error_buf, error_buf_size);
+        if (!thunks->param_lower_thunks) { loader_free(thunks); return NULL; }
+        memset(thunks->param_lower_thunks, 0, num_params * sizeof(void*));
+
+        thunks->param_lower_thunk_exists = loader_malloc(num_params * sizeof(uint8), error_buf, error_buf_size);
+        if (!thunks->param_lower_thunk_exists) { loader_free(thunks->param_lower_thunks); loader_free(thunks); return NULL; }
+        memset(thunks->param_lower_thunk_exists, 0, num_params * sizeof(uint8));
+    }
+
+    if (num_results > 0) {
+        thunks->result_lift_thunks = loader_malloc(num_results * sizeof(void*), error_buf, error_buf_size);
+        if (!thunks->result_lift_thunks) {
+            if(thunks->param_lower_thunks) loader_free(thunks->param_lower_thunks);
+            if(thunks->param_lower_thunk_exists) loader_free(thunks->param_lower_thunk_exists);
+            loader_free(thunks);
+            return NULL;
+        }
+        memset(thunks->result_lift_thunks, 0, num_results * sizeof(void*));
+
+        thunks->result_lift_thunk_exists = loader_malloc(num_results * sizeof(uint8), error_buf, error_buf_size);
+        if (!thunks->result_lift_thunk_exists) {
+            if(thunks->param_lower_thunks) loader_free(thunks->param_lower_thunks);
+            if(thunks->param_lower_thunk_exists) loader_free(thunks->param_lower_thunk_exists);
+            loader_free(thunks->result_lift_thunks);
+            loader_free(thunks);
+            return NULL;
+        }
+        memset(thunks->result_lift_thunk_exists, 0, num_results * sizeof(uint8));
+    }
+    return thunks;
+}
+
+static void
+destroy_jit_thunks_holder(WASMComponentFuncJITThunks *thunks) {
+    if (thunks) {
+        if (thunks->param_lower_thunks) loader_free(thunks->param_lower_thunks);
+        if (thunks->param_lower_thunk_exists) loader_free(thunks->param_lower_thunk_exists);
+        if (thunks->result_lift_thunks) loader_free(thunks->result_lift_thunks);
+        if (thunks->result_lift_thunk_exists) loader_free(thunks->result_lift_thunk_exists);
+        loader_free(thunks);
+    }
+}
+
+// Forward declaration
+static bool
+resolve_component_instance_exports(WASMComponentInstanceInternal *comp_inst,
+                                   WASMExecEnv *exec_env, /* For JIT context */
+                                   AOTCompContext *aot_comp_ctx, /* Pass JIT context for thunks */
+                                   char *error_buf, uint32 error_buf_size);
+
+static void
+destroy_resolved_component_exports(WASMComponentInstanceInternal *comp_inst);
+
+static void
+destroy_resolved_component_imports(WASMComponentInstanceInternal *comp_inst);
 
 
 static void

@@ -17,6 +17,8 @@ extern "C" {
 
 // Forward declaration
 typedef struct WASMComponentInstanceInternal WASMComponentInstanceInternal;
+typedef struct WASMComponentFuncJITThunks WASMComponentFuncJITThunks; // New
+typedef struct LiftedFuncThunkContext LiftedFuncThunkContext;     // New (or ensure it's declared)
 typedef struct WASMModuleInstance WASMModuleInstance;
 typedef struct WASMFunctionInstance WASMFunctionInstance;
 typedef struct WASMMemoryInstance WASMMemoryInstance;
@@ -39,11 +41,12 @@ typedef struct ResolvedComponentImportItem {
         WASMComponentInstanceInternal *component_instance;
 
         // For a function that is defined at the component level (lifted/lowered)
-        struct {
-            void *func_ptr;     // e.g., native C function pointer for a host func, or lifted func
+        struct ImportComponentFuncContext { // Renamed for clarity
+            void *func_ptr;     // e.g., native C function pointer for a host func
             void *env;          // Environment for this function
-            // WASMComponentFuncType *comp_func_type; // Component function type for validation & lifting
-        } component_func;
+            WASMComponentFuncType *func_type; // Component function type for validation & thunk generation
+            WASMComponentFuncJITThunks *jit_thunks; /* NULL if not JITted or JIT disabled */
+        } import_component_func;
 
         // If the import is a component model type definition
         // WASMComponentValType *type_def; // Not typically a runtime import item
@@ -52,30 +55,43 @@ typedef struct ResolvedComponentImportItem {
 } ResolvedComponentImportItem;
 
 // Structure to represent resolved export items of a component instance
-// Forward declare LiftedFuncThunkContext if its definition is not included above this point
-struct LiftedFuncThunkContext;
+// Definition for JIT thunks associated with a component function
+struct WASMComponentFuncJITThunks {
+    // For lowering parameters
+    void **param_lower_thunks;
+    uint8 *param_lower_thunk_exists; // Bitmap or array of bools
+
+    // For lifting results
+    void **result_lift_thunks;
+    uint8 *result_lift_thunk_exists; // Bitmap or array of bools
+
+    uint32 num_params;
+    uint32 num_results;
+};
+
+// Context for a component function that might be lifted/lowered, potentially JIT-ted
+struct LiftedFuncThunkContext {
+    /* Original target function (e.g. core wasm func, or host func for imports) */
+    void *original_func_ptr;
+    void *original_env; /* Environment for the original_func_ptr */
+    WASMComponentFuncType *func_type; /* Component function type */
+
+    /* JIT-compiled thunks for this function */
+    WASMComponentFuncJITThunks *jit_thunks; /* NULL if not JITted or JIT disabled */
+};
 
 typedef struct ResolvedComponentExportItem {
     char *name; // Name of the export
-    /* kind should align with WASMComponentExportKind enum from wasm_component_loader.h if applicable,
-       or a runtime-specific kind enum. Using uint8 if actual enum is not defined here. */
     uint8 kind; /* ResolvedComponentExportItemKind or WASMComponentExportKind */
     uint32 type_annotation_idx; /* Optional: type index for the export's description */
 
     union {
-        // For a core module item being exported (e.g. a function from an inner module)
         WASMFunctionInstance *function; // Used if kind is core function
         WASMMemoryInstance *memory;
         WASMTableInstance *table;
         WASMGlobalInstance *global;
-
-        // For a nested component instance being exported
-        WASMComponentInstanceInternal *component_instance; // Used if kind is INSTANCE or COMPONENT (runtime representation)
-
-        // For a component-level function (lifted/lowered)
-        struct LiftedFuncThunkContext *function_thunk_context; // Used for EXPORT_KIND_FUNC
-
-        // For a type definition being exported
+        WASMComponentInstanceInternal *component_instance;
+        LiftedFuncThunkContext *function_thunk_context; // Used for EXPORT_KIND_FUNC
         WASMComponentDefinedType *type_definition; // Used for EXPORT_KIND_TYPE
 
         // For a value being exported (actual runtime representation of the value)
